@@ -152,6 +152,7 @@ def download_resource(
     try:
         with requests.get(file_url, stream=True) as response:
             response.raise_for_status()
+            # Use .get('content-length', '0') to safely handle missing header
             total_size = int(response.headers.get('content-length', 0))
             block_size = 1024  # 1 KB
 
@@ -159,14 +160,17 @@ def download_resource(
                 total=total_size,
                 unit='iB',
                 unit_scale=True,
-                desc=f"Downloading {file_name}"
+                desc=f"Downloading {file_name}",
+                disable=total_size == 0 # Disable bar if total size is unknown
             ) as progress_bar:
                 for data in response.iter_content(block_size):
                     progress_bar.update(len(data))
                     f.write(data)
 
-            if total_size != 0 and progress_bar.n != total_size:
-                logger.warning(f"Download of '{file_name}' might be incomplete.")
+            # --- FIX: Only warn if content-length was provided and doesn't match ---
+            if total_size > 0 and progress_bar.n != total_size:
+                logger.warning(f"Download of '{file_name}' might be incomplete. "
+                               f"Expected {total_size} bytes, got {progress_bar.n} bytes.")
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to download '{file_name}': {e}")
@@ -177,6 +181,7 @@ def download_resource(
 
     logger.info(f"Download of '{file_name}' completed successfully to '{file_path}'.")
     return file_path
+
 def load_keras_tokenizer(tokenizer_json_path: Union[str, Path]) -> tf.keras.preprocessing.text.Tokenizer:
     """
     Loads a Keras tokenizer from a JSON file.

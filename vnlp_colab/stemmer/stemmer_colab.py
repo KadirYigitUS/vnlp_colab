@@ -64,6 +64,8 @@ class StemmerAnalyzer:
     The underlying model is an implementation of "The Role of Context in Neural
     Morphological Disambiguation", optimized for Keras 3 and Colab.
     """
+# In vnlp_colab/stemmer/stemmer_colab.py
+
     def __init__(self, evaluate: bool = False):
         """
         Initializes the model, loads all necessary resources, and compiles the
@@ -74,6 +76,9 @@ class StemmerAnalyzer:
         config = _MODEL_CONFIGS['StemmerAnalyzer']
         self.params = config['params']
         cache_dir = get_vnlp_cache_dir()
+
+        # --- FIX: Isolate the post-processing parameter ---
+        self.capitalize_pnons = self.params.pop('capitalize_pnons', False)
 
         # --- Download and Load Resources ---
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
@@ -90,6 +95,7 @@ class StemmerAnalyzer:
         tag_vocab_size = len(self.tokenizer_tag.word_index) + 1
 
         # --- Build and Load Model ---
+        # The **self.params call is now safe because 'capitalize_pnons' has been removed.
         self.model = create_stemmer_model(
             char_vocab_size=char_vocab_size,
             tag_vocab_size=tag_vocab_size,
@@ -99,7 +105,6 @@ class StemmerAnalyzer:
         with open(weights_path, 'rb') as fp:
             self.model.set_weights(pickle.load(fp))
 
-        # Use singleton for the candidate generator
         self.candidate_generator = get_candidate_generator_instance(case_sensitive=True)
         self._initialize_compiled_predict_step()
         logger.info("StemmerAnalyzer model initialized successfully.")
@@ -133,12 +138,9 @@ class StemmerAnalyzer:
         if not tokens:
             return []
 
-        # 1. Generate analysis candidates for each token in the sentence
         sentence_analyses = [self.candidate_generator.get_analysis_candidates(token) for token in tokens]
         data_for_processing = [(tokens, sentence_analyses)]
         
-        # Note: The 'shuffle' argument is not used for inference.
-        # 2. Preprocess the entire sentence data into NumPy arrays        
         x_numpy, _ = process_stemmer_input(
             data_for_processing, self.tokenizer_char, self.tokenizer_tag,
             stem_max_len=self.params['stem_max_len'],
@@ -148,7 +150,6 @@ class StemmerAnalyzer:
             num_max_analysis=self.params['num_max_analysis']
         )
         
-        # 3. Perform batched prediction using the compiled function        
         if len(tokens) <= batch_size:
             probs = self.compiled_predict_step(*x_numpy)
         else:
@@ -158,24 +159,22 @@ class StemmerAnalyzer:
                 all_probs.append(self.compiled_predict_step(*batch_x))
             probs = tf.concat(all_probs, axis=0)
 
-        # 4. Mask and find the best analysis for each token
         ambig_levels = np.array([len(a) for a in sentence_analyses], dtype=np.int32)
         mask = tf.sequence_mask(ambig_levels, maxlen=self.params['num_max_analysis'], dtype=tf.float32)
         
         predicted_indices = tf.argmax(probs * mask, axis=-1).numpy()
 
-        # 5. Format the final result
         final_result = []
         for i, analyses in enumerate(sentence_analyses):
             pred_idx = predicted_indices[i]
             if pred_idx < len(analyses):
                 root, _, tags = analyses[pred_idx]
-                if "Prop" in tags and self.params['capitalize_pnons']:
+                # --- FIX: Use the instance attribute directly ---
+                if "Prop" in tags and self.capitalize_pnons:
                     root = capitalize(root)
                 analysis_str = "+".join([root] + tags).replace('+DB', '^DB')
                 final_result.append(analysis_str)
             else:
-                # Fallback for tokens with no valid analyses or prediction errors
                 final_result.append(tokens[i] + "+Unknown")
 
         return final_result
