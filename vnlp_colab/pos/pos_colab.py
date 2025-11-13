@@ -139,7 +139,8 @@ class SPUContextPoS:
         Returns:
             List[Tuple[str, str]]: A list of (token, pos_label) tuples.
         """
-        if not tokens: return []
+        if not tokens:
+            return []
 
         int_preds: List[int] = []
 
@@ -205,7 +206,9 @@ class TreeStackPoS:
         Returns:
              List of (token, pos_label).
         """
-        if not tokens: return []
+        if not tokens:
+            return []
+            
         sentence_analyses = self.stemmer_analyzer.predict(tokens)
         
         pos_int_labels: List[int] = []
