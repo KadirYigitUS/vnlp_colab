@@ -17,8 +17,8 @@
 Keras 3 compliant utilities for the Stemmer/Morphological Analyzer.
 
 This module provides the modernized model creation and data processing functions
-for the morphological disambiguation model. THIS IS THE CORRECTED VERSION
-THAT STRICTLY FOLLOWS THE MODEL BLUEPRINT.
+for the morphological disambiguation model. THIS IS THE FINAL CORRECTED VERSION
+that prevents incorrect weight sharing and matches the original architecture.
 """
 import logging
 from typing import List, Tuple, Dict, Any
@@ -34,81 +34,99 @@ def create_stemmer_model(
     stem_max_len: int,
     char_vocab_size: int,
     char_embed_size: int,
+    stem_num_rnn_units: int,
     tag_max_len: int,
     tag_vocab_size: int,
     tag_embed_size: int,
+    tag_num_rnn_units: int,
     sentence_max_len: int,
     surface_token_max_len: int,
-    dropout: float,
+    embed_join_type: str = 'add',
+    dropout: float = 0.2,
+    num_rnn_stacks: int = 1,
     **kwargs # Accept other params to avoid breaking the call
 ) -> keras.Model:
     """
     Builds the stemmer/morphological disambiguation model using Keras 3 Functional API.
 
-    This architecture is a 1:1 replica of the original model blueprint, ensuring
-    weight compatibility. It uses simple GRUs, not Bidirectional GRUs.
+    This version correctly avoids unintended weight sharing in the context processors,
+    ensuring a 1:1 match with the original model's weight structure.
     """
-    logger.info("Creating Keras 3 Stemmer/Morphological Disambiguation model (Blueprint Replica)...")
+    logger.info("Creating Keras 3 Stemmer/Morphological Disambiguation model (Corrected)...")
+    surface_num_rnn_units = stem_num_rnn_units + tag_num_rnn_units
 
     # --- 1. Define Inputs ---
-    # These shapes match the blueprint's InputLayer shapes
-    stem_input = keras.Input(shape=(num_max_analysis, stem_max_len), dtype='int32', name='input_layer')
-    tag_input = keras.Input(shape=(num_max_analysis, tag_max_len), dtype='int32', name='input_layer_2')
-    surface_left_input = keras.Input(shape=(sentence_max_len, surface_token_max_len), dtype='int32', name='input_layer_4')
-    surface_right_input = keras.Input(shape=(sentence_max_len, surface_token_max_len), dtype='int32', name='input_layer_6')
+    stem_input = keras.Input(shape=(num_max_analysis, stem_max_len), dtype='int32', name='stem_input')
+    tag_input = keras.Input(shape=(num_max_analysis, tag_max_len), dtype='int32', name='tag_input')
+    surface_left_input = keras.Input(shape=(sentence_max_len, surface_token_max_len), dtype='int32', name='surface_left_input')
+    surface_right_input = keras.Input(shape=(sentence_max_len, surface_token_max_len), dtype='int32', name='surface_right_input')
 
-    # --- 2. Define Shared Embedding Layer ---
-    # The blueprint shows a single embedding layer shared across three inputs
-    char_embedding_layer = keras.layers.Embedding(char_vocab_size, char_embed_size, name='embedding')
-    
-    # A separate embedding layer for tags
-    tag_embedding_layer = keras.layers.Embedding(tag_vocab_size, tag_embed_size, name='embedding_1')
+    # --- 2. Define Shared Layers & Reusable Sub-Models ---
+    char_embedding = keras.layers.Embedding(char_vocab_size, char_embed_size, name='char_embedding')
+    tag_embedding = keras.layers.Embedding(tag_vocab_size, tag_embed_size, name='tag_embedding')
+
+    stem_rnn = keras.Sequential([
+        keras.layers.Bidirectional(keras.layers.GRU(stem_num_rnn_units, return_sequences=True)),
+        keras.layers.Dropout(dropout),
+        keras.layers.Bidirectional(keras.layers.GRU(stem_num_rnn_units)),
+        keras.layers.Dropout(dropout),
+    ], name='stem_char_rnn')
+
+    tag_rnn = keras.Sequential([
+        keras.layers.Bidirectional(keras.layers.GRU(tag_num_rnn_units, return_sequences=True)),
+        keras.layers.Dropout(dropout),
+        keras.layers.Bidirectional(keras.layers.GRU(tag_num_rnn_units)),
+        keras.layers.Dropout(dropout),
+    ], name='tag_char_rnn')
+
+    # --- FIX: Create TWO SEPARATE models for left and right context character processing ---
+    surface_char_rnn_left = keras.Sequential([
+        keras.layers.Bidirectional(keras.layers.GRU(surface_num_rnn_units, return_sequences=True)),
+        keras.layers.Dropout(dropout),
+        keras.layers.Bidirectional(keras.layers.GRU(surface_num_rnn_units)),
+        keras.layers.Dropout(dropout),
+    ], name='surface_char_rnn_left')
+
+    surface_char_rnn_right = keras.Sequential([
+        keras.layers.Bidirectional(keras.layers.GRU(surface_num_rnn_units, return_sequences=True)),
+        keras.layers.Dropout(dropout),
+        keras.layers.Bidirectional(keras.layers.GRU(surface_num_rnn_units)),
+        keras.layers.Dropout(dropout),
+    ], name='surface_char_rnn_right')
 
     # --- 3. Build "R" Component (Analysis Representation) ---
-    stem_embedded = char_embedding_layer(stem_input)
-    tag_embedded = tag_embedding_layer(tag_input)
+    stem_embedded = char_embedding(stem_input)
+    td_stem_rnn = keras.layers.TimeDistributed(stem_rnn)(stem_embedded)
 
-    # Flatten the character dimension before the GRU for candidate analyses
-    stem_flat = keras.layers.Reshape((num_max_analysis, -1))(stem_embedded)
-    tag_flat = keras.layers.Reshape((num_max_analysis, -1))(tag_embedded)
-    
-    # According to the blueprint, TimeDistributed layers process the embeddings
-    td_stem = keras.layers.TimeDistributed(keras.layers.Dense(256, activation='tanh'))(stem_flat)
-    td_tag = keras.layers.TimeDistributed(keras.layers.Dense(256, activation='tanh'))(tag_flat)
+    tag_embedded = tag_embedding(tag_input)
+    td_tag_rnn = keras.layers.TimeDistributed(tag_rnn)(tag_embedded)
 
-    joined_stem_tag = keras.layers.Add(name='add')([td_stem, td_tag])
-    R = keras.layers.Activation('tanh', name='activation')(joined_stem_tag)
+    joined_stem_tag = keras.layers.Add()([td_stem_rnn, td_tag_rnn])
+    R = keras.layers.Activation('tanh')(joined_stem_tag)
 
     # --- 4. Build "h" Component (Context Representation) ---
-    left_context_embedded = char_embedding_layer(surface_left_input)
-    right_context_embedded = char_embedding_layer(surface_right_input)
+    surface_embedded_left = char_embedding(surface_left_input)
+    td_surface_left = keras.layers.TimeDistributed(surface_char_rnn_left)(surface_embedded_left)
+    surface_left_context = keras.layers.GRU(surface_num_rnn_units)(td_surface_left)
 
-    # Flatten the character dimension for context
-    left_context_flat = keras.layers.Reshape((sentence_max_len, -1))(left_context_embedded)
-    right_context_flat = keras.layers.Reshape((sentence_max_len, -1))(right_context_embedded)
-    
-    td_left = keras.layers.TimeDistributed(keras.layers.Dense(512, activation='tanh'))(left_context_flat)
-    td_right = keras.layers.TimeDistributed(keras.layers.Dense(512, activation='tanh'))(right_context_flat)
+    surface_embedded_right = char_embedding(surface_right_input)
+    td_surface_right = keras.layers.TimeDistributed(surface_char_rnn_right)(surface_embedded_right)
+    surface_right_context = keras.layers.GRU(surface_num_rnn_units, go_backwards=True)(td_surface_right)
 
-    # Simple GRUs as per the blueprint
-    left_context_vector = keras.layers.GRU(256, name='gru_3')(td_left)
-    right_context_vector = keras.layers.GRU(256, go_backwards=True, name='gru_5')(td_right)
-
-    joined_context = keras.layers.Add(name='add_1')([left_context_vector, right_context_vector])
-    h = keras.layers.Activation('tanh', name='activation_1')(joined_context)
+    joined_context = keras.layers.Add()([surface_left_context, surface_right_context])
+    h = keras.layers.Activation('tanh')(joined_context)
 
     # --- 5. Final Combination and Output ---
-    p = keras.layers.Dot(axes=(2, 1), name='dot')([R, h])
-    p = keras.layers.Dense(20, name='dense')(p)
-    p = keras.layers.Dropout(dropout, name='dropout_4')(p)
-    p = keras.layers.Dense(num_max_analysis, activation='softmax', name='dense_1')(p)
+    p = keras.layers.Dot(axes=(2, 1))([R, h])
+    p = keras.layers.Dense(num_max_analysis * 2, activation='tanh')(p)
+    p = keras.layers.Dropout(dropout)(p)
+    p = keras.layers.Dense(num_max_analysis, activation='softmax')(p)
 
     model = keras.Model(
         inputs=[stem_input, tag_input, surface_left_input, surface_right_input],
         outputs=p,
-        name='StemmerDisambiguationModel_Blueprint'
+        name='StemmerDisambiguationModel'
     )
-    logger.info("Stemmer model (Blueprint Replica) created successfully.")
     return model
 
 def process_stemmer_input(
@@ -121,10 +139,6 @@ def process_stemmer_input(
     sentence_max_len: int,
     num_max_analysis: int
 ) -> Tuple[Tuple[np.ndarray, ...], np.ndarray]:
-    """
-    Processes raw data into NumPy arrays for the stemmer model.
-    (This function remains correct and does not need changes).
-    """
     all_tokens_data = []
     for sentence_tokens, sentence_analyses in data:
         for i in range(len(sentence_tokens)):
@@ -136,9 +150,7 @@ def process_stemmer_input(
 
     num_total_tokens = len(all_tokens_data)
     if num_total_tokens == 0:
-        empty_inputs = (np.array([]), np.array([]), np.array([]), np.array([]))
-        empty_labels = np.array([])
-        return empty_inputs, empty_labels
+        return (np.array([]), np.array([]), np.array([]), np.array([])), np.array([])
 
     stems_batch = np.zeros((num_total_tokens, num_max_analysis, stem_max_len), dtype=np.int32)
     tags_batch = np.zeros((num_total_tokens, num_max_analysis, tag_max_len), dtype=np.int32)
