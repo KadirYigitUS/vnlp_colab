@@ -47,7 +47,7 @@ def create_spucontext_dp_model(
     fc_units_multiplier: tuple[int, int],
     dropout: float
 ) -> keras.Model:
-       """
+    """
     Builds the SPUContext Dependency Parser model using the Keras 3 Functional API.
 
     This architecture is a 1:1 replica of the original model blueprint, ensuring
