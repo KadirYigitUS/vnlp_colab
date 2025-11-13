@@ -1,0 +1,38 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vnlp_colab"
+version = "1.0.0"
+authors = [
+  { name="VNLP Project Authors" },
+]
+description = "A Colab-optimized version of the VNLP library for high-performance Turkish NLP."
+readme = "README.md"
+license = { text = "AGPL-3.0" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: OS Independent",
+    "Topic :: Text Processing :: Linguistic",
+]
+
+# All required dependencies for the pipeline to run in a fresh environment.
+dependencies = [
+    "tensorflow>=2.15.0",
+    "keras>=3.0.0",
+    "numpy>=1.26.0",
+    "pandas>=2.0.0",
+    "sentencepiece==0.2.1",
+    "spylls>=0.1.5",
+    "tqdm>=4.62.0",
+    "regex>=2023.6.3",
+    "requests>=2.28.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/vngrs-ai/vnlp"
+"Bug Tracker" = "https://github.com/vngrs-ai/vnlp/issues"
