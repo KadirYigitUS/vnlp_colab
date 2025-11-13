@@ -198,7 +198,7 @@ class TreeStackPoS:
         logger.info("TreeStackPoS model initialized successfully.")
 
     def predict(self, tokens: List[str]) -> List[Tuple[str, str]]:
-                """
+        """
         Args:
             sentence:
                 Input text(sentence).
