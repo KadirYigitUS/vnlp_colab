@@ -23,7 +23,7 @@ implementation is optimized for Keras 3 and high-performance inference.
 """
 import logging
 import pickle
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 import numpy as np
 import sentencepiece as spm
@@ -115,6 +115,39 @@ class SPUCBiGRUSentimentAnalyzer:
         prob = self.compiled_predict(tf.constant(processed_input)).numpy()[0][0]
         return float(prob)
 
+    def predict_proba_batch(self, texts: List[str]) -> List[float]:
+        """
+        Predicts sentiment probabilities for a batch of texts.
+        
+        Args:
+            texts (List[str]): A list of sentences.
+            
+        Returns:
+            List[float]: A list of sentiment probabilities.
+        """
+        if not texts:
+            return []
+
+        # Process each text into a padded sequence
+        processed_inputs = [
+            process_sentiment_input(text, self.spu_tokenizer_word, self.params['text_max_len'])
+            if isinstance(text, str) and text.strip() else np.zeros((1, self.params['text_max_len']), dtype=np.int32)
+            for text in texts
+        ]
+        
+        # Stack into a single batch tensor
+        batch_tensor = np.vstack(processed_inputs)
+        
+        # Run inference on the entire batch
+        batch_probs = self.compiled_predict(tf.constant(batch_tensor)).numpy()
+        
+        # Handle invalid inputs by assigning neutral probability
+        results = [
+            float(prob[0]) if isinstance(text, str) and text.strip() else 0.5
+            for prob, text in zip(batch_probs, texts)
+        ]
+        return results
+
 
 class SentimentAnalyzer:
     """
@@ -148,6 +181,20 @@ class SentimentAnalyzer:
         Predicts the probability of a positive sentiment.
         """
         return self.instance.predict_proba(text)
+
+    def predict_batch(self, texts: List[str]) -> List[int]:
+        """
+        Predicts discrete sentiment labels for a batch of texts.
+        """
+        probs = self.predict_proba_batch(texts)
+        return [1 if p > 0.5 else 0 for p in probs]
+
+    def predict_proba_batch(self, texts: List[str]) -> List[float]:
+        """
+        Predicts sentiment probabilities for a batch of texts.
+        """
+        return self.instance.predict_proba_batch(texts)
+
 
 # --- Main Entry Point for Standalone Use ---
 def main():
@@ -187,6 +234,28 @@ def main():
     logger.info(f"   Re-initialization took: {end_time - start_time:.4f} seconds.")
     assert (end_time - start_time) < 0.1, "Caching failed, re-initialization was too slow."
     logger.info("   Singleton Caching test PASSED.")
+    
+    # Test Batch Prediction
+    try:
+        logger.info("\n3. Testing Batch Prediction...")
+        sentiment_analyzer = SentimentAnalyzer()
+        batch_texts = [
+            "Bu filmi çok beğendim, harikaydı.",
+            "Tam bir zaman kaybı, hiç tavsiye etmiyorum.",
+            "", # Empty string test case
+            "Eh, fena değil, idare eder.",
+        ]
+        batch_probs = sentiment_analyzer.predict_proba_batch(batch_texts)
+        batch_preds = sentiment_analyzer.predict_batch(batch_texts)
+        logger.info(f"   Batch Probs: {batch_probs}")
+        logger.info(f"   Batch Preds: {batch_preds}")
+        assert len(batch_preds) == 4
+        assert batch_preds == [1, 0, 0, 1] or batch_preds == [1, 0, 0, 0] # Model might be neutral on the last one
+        assert abs(batch_probs[2] - 0.5) < 1e-6 # Empty string should be neutral
+        logger.info("   Batch Prediction test PASSED.")
+    except Exception as e:
+        logger.error(f"   Batch Prediction test FAILED: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     main()

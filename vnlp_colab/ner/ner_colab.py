@@ -95,7 +95,6 @@ class SPUContextNER:
         
         word_embedding_matrix = np.load(embedding_path)
         
-        # --- MODIFIED: Explicitly pass arguments to prevent TypeErrors ---
         num_rnn_units = params['word_embedding_dim'] * params['rnn_units_multiplier']
         
         self.model = create_spucontext_ner_model(
@@ -119,10 +118,10 @@ class SPUContextNER:
     def _initialize_compiled_predict_step(self):
         entity_vocab_size = len(self.tokenizer_label.word_index)
         input_signature = [
-            tf.TensorSpec(shape=(1, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, entity_vocab_size + 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, entity_vocab_size + 1), dtype=tf.float32),
         ]
 
         @tf.function(input_signature=input_signature)
@@ -132,21 +131,59 @@ class SPUContextNER:
         self.compiled_predict_step = predict_step
 
     def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> Union[List[Tuple[str, str]], Dict]:
-        if not tokens: return []
-        num_tokens = len(tokens)
-        int_preds: List[int] = []
+        if not tokens:
+            return []
+        result = self.predict_batch([sentence], [tokens])[0]
+        return ner_to_displacy_format(sentence, result) if displacy_format else result
 
-        for t in range(num_tokens):
-            inputs_np = process_ner_input(t, tokens, self.spu_tokenizer_word, self.tokenizer_label, int_preds)
-            inputs_tf = [tf.convert_to_tensor(arr) for arr in inputs_np]
-            logits = self.compiled_predict_step(*inputs_tf).numpy()[0]
-            int_pred = np.argmax(logits, axis=-1)
-            int_preds.append(int_pred)
+    def predict_batch(self, batch_of_sentences: List[str], batch_of_tokens: List[List[str]]) -> List[List[Tuple[str, str]]]:
+        if not any(batch_of_tokens):
+            return [[] for _ in batch_of_tokens]
 
-        preds = [self._label_index_word.get(p, 'O') for p in int_preds]
-        ner_result = list(zip(tokens, preds))
+        batch_size = len(batch_of_tokens)
+        max_len = max(len(s) for s in batch_of_tokens) if batch_of_tokens else 0
+        batch_int_preds = [[] for _ in range(batch_size)]
 
-        return ner_to_displacy_format(sentence, ner_result) if displacy_format else ner_result
+        for t in range(max_len):
+            active_indices, step_inputs = [], []
+            word_batch, left_ctx_batch, right_ctx_batch, lc_entity_history_batch = [], [], [], []
+            
+            for i in range(batch_size):
+                if t < len(batch_of_tokens[i]):
+                    active_indices.append(i)
+                    inputs_np = process_ner_input(
+                        t, batch_of_tokens[i], self.spu_tokenizer_word, 
+                        self.tokenizer_label, batch_int_preds[i]
+                    )
+                    word_batch.append(inputs_np[0])
+                    left_ctx_batch.append(inputs_np[1])
+                    right_ctx_batch.append(inputs_np[2])
+                    lc_entity_history_batch.append(inputs_np[3])
+
+            if not active_indices:
+                break
+
+            inputs_tf = [
+                tf.convert_to_tensor(np.vstack(word_batch)),
+                tf.convert_to_tensor(np.vstack(left_ctx_batch)),
+                tf.convert_to_tensor(np.vstack(right_ctx_batch)),
+                tf.convert_to_tensor(np.vstack(lc_entity_history_batch)),
+            ]
+            
+            logits = self.compiled_predict_step(*inputs_tf).numpy()
+            step_preds = np.argmax(logits, axis=-1)
+
+            for i, pred in enumerate(step_preds):
+                original_index = active_indices[i]
+                batch_int_preds[original_index].append(pred)
+
+        final_results = []
+        for i in range(batch_size):
+            preds = [self._label_index_word.get(p, 'O') for p in batch_int_preds[i]]
+            final_results.append(list(zip(batch_of_tokens[i], preds)))
+        
+        return final_results
+
 
 class CharNER:
     """Character-Level Named Entity Recognizer."""
@@ -179,15 +216,14 @@ class CharNER:
         self.padding_strat = params['padding_strat']
         logger.info("CharNER model initialized successfully.")
 
-    def _predict_char_level(self, tokens: List[str]) -> np.ndarray:
-        text = " ".join(tokens)
-        char_sequence = list(text)
-        sequences = self.tokenizer_char.texts_to_sequences([char_sequence])
+    def _predict_char_level_batch(self, texts: List[str]) -> np.ndarray:
+        char_sequences = [list(text) for text in texts]
+        sequences = self.tokenizer_char.texts_to_sequences(char_sequences)
         padded = keras.preprocessing.sequence.pad_sequences(
             sequences, maxlen=self.seq_len_max, padding=self.padding_strat
         )
-        raw_pred = self.model(padded, training=False)
-        return np.argmax(raw_pred, axis=2).flatten()
+        raw_preds = self.model(padded, training=False)
+        return np.argmax(raw_preds, axis=2)
 
     def _charner_decoder(self, tokens: List[str], preds: np.ndarray) -> List[str]:
         lens = [0] + [len(token) + 1 for token in tokens]
@@ -204,26 +240,25 @@ class CharNER:
         return decoded_entities
 
     def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> Union[List[Tuple[str, str]], Dict]:
-        internal_tokens = WordPunctTokenize(sentence)
-        if len(" ".join(internal_tokens)) > self.seq_len_max:
-            mid = len(internal_tokens) // 2
-            first_half_sent = " ".join(internal_tokens[:mid])
-            second_half_sent = " ".join(internal_tokens[mid:])
-            first_half_res = self.predict(first_half_sent, [], displacy_format)
-            second_half_res = self.predict(second_half_sent, [], displacy_format)
-            if displacy_format:
-                second_half_res['text'] = first_half_res['text'] + " " + second_half_res['text']
-                second_half_res['ents'].extend(first_half_res['ents'])
-                return second_half_res
-            else:
-                return first_half_res + second_half_res
+        # Tokens are ignored, CharNER does its own tokenization.
+        results = self.predict_batch([sentence], [[]])[0]
+        return ner_to_displacy_format(sentence, results) if displacy_format else results
 
-
-        char_preds = self._predict_char_level(internal_tokens)
-        decoded_entities = self._charner_decoder(internal_tokens, char_preds)
-        ner_result = list(zip(internal_tokens, decoded_entities))
+    def predict_batch(self, batch_of_sentences: List[str], batch_of_tokens: List[List[str]]) -> List[List[Tuple[str, str]]]:
+        # The `batch_of_tokens` argument is ignored for API consistency.
+        internal_token_batch = [WordPunctTokenize(s) for s in batch_of_sentences]
+        texts_to_process = [" ".join(tokens) for tokens in internal_token_batch]
         
-        return ner_to_displacy_format(sentence, ner_result) if displacy_format else ner_result
+        char_preds_batch = self._predict_char_level_batch(texts_to_process)
+        
+        batch_results = []
+        for i, tokens in enumerate(internal_token_batch):
+            char_preds = char_preds_batch[i]
+            decoded_entities = self._charner_decoder(tokens, char_preds)
+            ner_result = list(zip(tokens, decoded_entities))
+            batch_results.append(ner_result)
+        
+        return batch_results
 
 
 class NamedEntityRecognizer:
@@ -247,6 +282,9 @@ class NamedEntityRecognizer:
 
     def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> Union[List[Tuple[str, str]], Dict]:
         return self.instance.predict(sentence, tokens, displacy_format)
+    
+    def predict_batch(self, batch_of_sentences: List[str], batch_of_tokens: List[List[str]]) -> List[List[Tuple[str, str]]]:
+        return self.instance.predict_batch(batch_of_sentences, batch_of_tokens)
 
 
 def main():
@@ -255,31 +293,43 @@ def main():
     setup_logging()
     logger.info("--- VNLP Colab NER Test Suite ---")
     
+    # --- SPUContextNER Tests ---
     try:
         logger.info("\n1. Testing SPUContextNER...")
         ner_spu = NamedEntityRecognizer(model='SPUContextNER')
         sentence1 = "Benim adım Melikşah, İstanbul'da yaşıyorum."
         tokens1 = WordPunctTokenize(sentence1)
         result1 = ner_spu.predict(sentence1, tokens1)
-        logger.info(f"   Input: '{sentence1}'")
-        logger.info(f"   Output: {result1}")
+        logger.info(f"   SPUContextNER Single Output: {result1}")
         assert len(result1) > 0 and result1[2][1] == 'PER'
+
+        batch_sents1 = ["Benim adım Melikşah.", "VNGRS AI Takımı'nda çalışıyorum."]
+        batch_tokens1 = [WordPunctTokenize(s) for s in batch_sents1]
+        batch_res1 = ner_spu.predict_batch(batch_sents1, batch_tokens1)
+        logger.info(f"   SPUContextNER Batch Output: {batch_res1}")
+        assert len(batch_res1) == 2 and batch_res1[0][2][1] == 'PER' and batch_res1[1][0][1] == 'ORG'
         logger.info("   SPUContextNER test PASSED.")
     except Exception as e:
         logger.error(f"   SPUContextNER test FAILED: {e}", exc_info=True)
 
+    # --- CharNER Tests ---
     try:
         logger.info("\n2. Testing CharNER...")
         ner_char = NamedEntityRecognizer(model='CharNER')
         sentence2 = "VNGRS AI Takımı'nda çalışıyorum."
         result2 = ner_char.predict(sentence2, []) # Tokens ignored by CharNER
-        logger.info(f"   Input: '{sentence2}'")
-        logger.info(f"   Output: {result2}")
+        logger.info(f"   CharNER Single Output: {result2}")
         assert len(result2) > 0 and result2[0][1] == 'ORG'
+
+        batch_sents2 = ["Ali Bey Ankara'ya gitti.", "Toplantı VNGRS ofisinde."]
+        batch_res2 = ner_char.predict_batch(batch_sents2, [[] for _ in batch_sents2])
+        logger.info(f"   CharNER Batch Output: {batch_res2}")
+        assert len(batch_res2) == 2 and batch_res2[0][0][1] == 'PER' and batch_res2[1][1][1] == 'ORG'
         logger.info("   CharNER test PASSED.")
     except Exception as e:
         logger.error(f"   CharNER test FAILED: {e}", exc_info=True)
         
+    # --- Singleton Caching Test ---
     logger.info("\n3. Testing Singleton Caching...")
     import time
     start_time = time.time()

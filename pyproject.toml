@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vnlp_colab"
-version = "2.0.2" # Incremented patch version for packaging fix
+version = "2.1.0" # Version bump for new features
 authors = [
   { name="VNLP Project Authors" },
 ]
@@ -36,8 +36,6 @@ dependencies = [
 "Homepage" = "https://github.com/vngrs-ai/vnlp"
 "Bug Tracker" = "https://github.com/vngrs-ai/vnlp/issues"
 
-# --- MODIFIED SECTION ---
-# This replaces the manual 'packages' list with automatic discovery.
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vnlp_colab*"]

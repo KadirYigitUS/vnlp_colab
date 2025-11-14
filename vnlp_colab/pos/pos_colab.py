@@ -88,7 +88,6 @@ class SPUContextPoS:
         self._label_index_word = {i: w for w, i in self.tokenizer_label.word_index.items()}
         word_embedding_matrix = np.load(embedding_matrix_path)
 
-        # --- MODIFIED: Explicitly pass arguments to prevent TypeErrors ---
         num_rnn_units = params['word_embedding_dim'] * params['rnn_units_multiplier']
         
         self.model = create_spucontext_pos_model(
@@ -112,10 +111,10 @@ class SPUContextPoS:
     def _initialize_compiled_predict_step(self):
         pos_vocab_size = len(self.tokenizer_label.word_index)
         input_signature = [
-            tf.TensorSpec(shape=(1, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, pos_vocab_size + 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, pos_vocab_size + 1), dtype=tf.float32),
         ]
 
         @tf.function(input_signature=input_signature)
@@ -124,16 +123,58 @@ class SPUContextPoS:
         self.compiled_predict_step = predict_step
 
     def predict(self, tokens: List[str]) -> List[Tuple[str, str]]:
-        if not tokens: return []
-        int_preds: List[int] = []
-        for t in range(len(tokens)):
-            inputs_np = process_pos_input(t, tokens, self.spu_tokenizer_word, self.tokenizer_label, int_preds)
-            inputs_tf = [tf.convert_to_tensor(arr) for arr in inputs_np]
-            logits = self.compiled_predict_step(*inputs_tf).numpy()[0]
-            int_pred = np.argmax(logits, axis=-1)
-            int_preds.append(int_pred)
-        pos_labels = [self._label_index_word.get(p, 'UNK') for p in int_preds]
-        return list(zip(tokens, pos_labels))
+        if not tokens:
+            return []
+        return self.predict_batch([tokens])[0]
+
+    def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[Tuple[str, str]]]:
+        if not any(batch_of_tokens):
+            return [[] for _ in batch_of_tokens]
+
+        batch_size = len(batch_of_tokens)
+        max_len = max(len(s) for s in batch_of_tokens) if batch_of_tokens else 0
+        batch_int_preds = [[] for _ in range(batch_size)]
+
+        for t in range(max_len):
+            active_indices, step_inputs = [], [], 
+            word_batch, left_ctx_batch, right_ctx_batch, lc_pos_history_batch = [], [], [], []
+            
+            for i in range(batch_size):
+                if t < len(batch_of_tokens[i]):
+                    active_indices.append(i)
+                    inputs_np = process_pos_input(
+                        t, batch_of_tokens[i], self.spu_tokenizer_word, 
+                        self.tokenizer_label, batch_int_preds[i]
+                    )
+                    word_batch.append(inputs_np[0])
+                    left_ctx_batch.append(inputs_np[1])
+                    right_ctx_batch.append(inputs_np[2])
+                    lc_pos_history_batch.append(inputs_np[3])
+
+            if not active_indices:
+                break
+
+            inputs_tf = [
+                tf.convert_to_tensor(np.vstack(word_batch)),
+                tf.convert_to_tensor(np.vstack(left_ctx_batch)),
+                tf.convert_to_tensor(np.vstack(right_ctx_batch)),
+                tf.convert_to_tensor(np.vstack(lc_pos_history_batch)),
+            ]
+            
+            logits = self.compiled_predict_step(*inputs_tf).numpy()
+            step_preds = np.argmax(logits, axis=-1)
+
+            for i, pred in enumerate(step_preds):
+                original_index = active_indices[i]
+                batch_int_preds[original_index].append(pred)
+
+        final_results = []
+        for i in range(batch_size):
+            labels = [self._label_index_word.get(p, 'UNK') for p in batch_int_preds[i]]
+            final_results.append(list(zip(batch_of_tokens[i], labels)))
+            
+        return final_results
+
 
 class TreeStackPoS:
     """Tree-stack Part of Speech Tagger class."""
@@ -172,20 +213,54 @@ class TreeStackPoS:
         logger.info("TreeStackPoS model initialized successfully.")
 
     def predict(self, tokens: List[str]) -> List[Tuple[str, str]]:
-        if not tokens: return []
-        sentence_analyses = self.stemmer_analyzer.predict(tokens)
-        pos_int_labels: List[int] = []
-        for t in range(len(tokens)):
-            x_inputs = process_treestack_pos_input(
-                tokens, sentence_analyses, pos_int_labels, self.tokenizer_word,
-                self.tokenizer_morph_tag, self.tokenizer_pos_label, self.params['word_form'],
-                self.params['sentence_max_len'], self.params['tag_max_len']
-            )
-            raw_pred = self.model(x_inputs, training=False).numpy()[0]
-            pos_int_label = np.argmax(raw_pred, axis=-1)
-            pos_int_labels.append(pos_int_label)
-        pos_labels = [self._pos_index_word.get(p, 'UNK') for p in pos_int_labels]
-        return list(zip(tokens, pos_labels))
+        if not tokens:
+            return []
+        return self.predict_batch([tokens])[0]
+        
+    def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[Tuple[str, str]]]:
+        if not any(batch_of_tokens):
+            return [[] for _ in batch_of_tokens]
+
+        batch_size = len(batch_of_tokens)
+        max_len = max(len(s) for s in batch_of_tokens) if batch_of_tokens else 0
+        batch_int_preds = [[] for _ in range(batch_size)]
+        
+        # Pre-calculate morphological analyses for the entire batch
+        batch_analyses = self.stemmer_analyzer.predict_batch(batch_of_tokens)
+
+        for t in range(max_len):
+            active_indices = []
+            step_inputs_list = []
+            
+            for i in range(batch_size):
+                if t < len(batch_of_tokens[i]):
+                    active_indices.append(i)
+                    inputs_np = process_treestack_pos_input(
+                        batch_of_tokens[i], batch_analyses[i], batch_int_preds[i],
+                        self.tokenizer_word, self.tokenizer_morph_tag, self.tokenizer_pos_label,
+                        self.params['word_form'], self.params['sentence_max_len'], self.params['tag_max_len']
+                    )
+                    step_inputs_list.append(inputs_np)
+
+            if not active_indices:
+                break
+            
+            # Stack the inputs for the current time step
+            stacked_inputs = [np.vstack([inputs[i] for inputs in step_inputs_list]) for i in range(len(step_inputs_list[0]))]
+            
+            logits = self.model(stacked_inputs, training=False).numpy()
+            step_preds = np.argmax(logits, axis=-1)
+
+            for i, pred in enumerate(step_preds):
+                original_index = active_indices[i]
+                batch_int_preds[original_index].append(pred)
+
+        final_results = []
+        for i in range(batch_size):
+            labels = [self._pos_index_word.get(p, 'UNK') for p in batch_int_preds[i]]
+            final_results.append(list(zip(batch_of_tokens[i], labels)))
+            
+        return final_results
 
 
 class PoSTagger:
@@ -211,37 +286,67 @@ class PoSTagger:
     def predict(self, tokens: List[str]) -> List[Tuple[str, str]]:
         return self.instance.predict(tokens)
 
+    def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[Tuple[str, str]]]:
+        return self.instance.predict_batch(batch_of_tokens)
+
 
 def main():
     """Demonstrates and tests the PoS Tagger module."""
     from vnlp_colab.utils_colab import setup_logging
     setup_logging()
     logger.info("--- VNLP Colab PoS Tagger Test Suite ---")
-    sentence = "Vapurla Beşiktaş'a geçip yürüyerek Maçka Parkı'na ulaştım."
-    tokens = TreebankWordTokenize(sentence)
-
+    
+    # --- SPUContextPoS Tests ---
     try:
         logger.info("\n1. Testing SPUContextPoS...")
         pos_spu = PoSTagger(model='SPUContextPoS')
-        result_spu = pos_spu.predict(tokens)
-        logger.info(f"   Input: {tokens}")
-        logger.info(f"   SPUContextPoS Output: {result_spu}")
-        assert len(result_spu) == len(tokens) and result_spu[1][1] == 'PROPN'
+        
+        # Single prediction test
+        tokens1 = TreebankWordTokenize("Vapurla Beşiktaş'a geçip yürüyerek Maçka Parkı'na ulaştım.")
+        result_spu1 = pos_spu.predict(tokens1)
+        logger.info(f"   SPUContextPoS Single Output: {result_spu1}")
+        assert len(result_spu1) == len(tokens1) and result_spu1[1][1] == 'PROPN'
+        
+        # Batch prediction test
+        batch1 = [
+            TreebankWordTokenize("Benim adım Melikşah."),
+            TreebankWordTokenize("İstanbul'da yaşıyorum.")
+        ]
+        batch_res1 = pos_spu.predict_batch(batch1)
+        logger.info(f"   SPUContextPoS Batch Output: {batch_res1}")
+        assert len(batch_res1) == 2
+        assert batch_res1[0][2][1] == 'PROPN' and batch_res1[1][0][1] == 'PROPN'
         logger.info("   SPUContextPoS test PASSED.")
     except Exception as e:
         logger.error(f"   SPUContextPoS test FAILED: {e}", exc_info=True)
 
+    # --- TreeStackPoS Tests ---
     try:
         logger.info("\n2. Testing TreeStackPoS...")
         pos_tree = PoSTagger(model='TreeStackPoS')
-        result_tree = pos_tree.predict(tokens)
-        logger.info(f"   Input: {tokens}")
-        logger.info(f"   TreeStackPoS Output: {result_tree}")
-        assert len(result_tree) == len(tokens) and result_tree[1][1] == 'PROPN'
+
+        # Single prediction test
+        tokens2 = TreebankWordTokenize("Vapurla Beşiktaş'a geçip yürüyerek Maçka Parkı'na ulaştım.")
+        result_tree2 = pos_tree.predict(tokens2)
+        logger.info(f"   TreeStackPoS Single Output: {result_tree2}")
+        assert len(result_tree2) == len(tokens2) and result_tree2[1][1] == 'PROPN'
+        
+        # Batch prediction test
+        batch2 = [
+            TreebankWordTokenize("Benim adım Melikşah."),
+            TreebankWordTokenize("İstanbul'da yaşıyorum."),
+            [] # Empty list test case
+        ]
+        batch_res2 = pos_tree.predict_batch(batch2)
+        logger.info(f"   TreeStackPoS Batch Output: {batch_res2}")
+        assert len(batch_res2) == 3
+        assert len(batch_res2[2]) == 0
+        assert batch_res2[0][2][1] == 'PROPN' and batch_res2[1][0][1] == 'PROPN'
         logger.info("   TreeStackPoS test PASSED.")
     except Exception as e:
         logger.error(f"   TreeStackPoS test FAILED: {e}", exc_info=True)
     
+    # --- Singleton Caching Test ---
     logger.info("\n3. Testing Singleton Caching...")
     import time
     start_time = time.time()

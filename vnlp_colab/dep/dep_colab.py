@@ -41,6 +41,8 @@ from vnlp_colab.dep.dep_treestack_utils_colab import (
 )
 from vnlp_colab.stemmer.stemmer_colab import StemmerAnalyzer, get_stemmer_analyzer
 from vnlp_colab.pos.pos_colab import PoSTagger
+from vnlp_colab.tokenizer_colab import TreebankWordTokenize
+
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +96,6 @@ class SPUContextDP:
         self.arc_label_vector_len = self.params_config['sentence_max_len'] + 1 + self.label_vocab_size + 1
         word_embedding_matrix = np.load(embedding_path)
 
-        # --- MODIFIED: Explicitly pass arguments to prevent TypeErrors ---
         params = self.params_config
         num_rnn_units = params['word_embedding_dim'] * params['rnn_units_multiplier']
         
@@ -115,10 +116,10 @@ class SPUContextDP:
 
     def _initialize_compiled_predict_step(self):
         input_signature = [
-            tf.TensorSpec(shape=(1, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
-            tf.TensorSpec(shape=(1, 40, self.arc_label_vector_len), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, 40, self.arc_label_vector_len), dtype=tf.float32),
         ]
 
         @tf.function(input_signature=input_signature)
@@ -127,21 +128,62 @@ class SPUContextDP:
         self.compiled_predict_step = predict_step
 
     def predict(self, tokens: List[str]) -> List[Tuple[int, str, int, str]]:
-        if not tokens: return []
-        arcs, labels = [], []
-        for t in range(len(tokens)):
-            inputs_np = process_dp_input(
-                t, tokens, self.spu_tokenizer_word, self.tokenizer_label,
-                self.arc_label_vector_len, arcs, labels
-            )
-            inputs_tf = [tf.convert_to_tensor(arr) for arr in inputs_np]
-            logits = self.compiled_predict_step(*inputs_tf).numpy()[0]
-            arc, label = decode_arc_label_vector(logits, self.params_config['sentence_max_len'], self.label_vocab_size)
-            arcs.append(arc)
-            labels.append(label)
+        if not tokens:
+            return []
+        return self.predict_batch([tokens])[0]
+
+    def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[Tuple[int, str, int, str]]]:
+        if not any(batch_of_tokens):
+            return [[] for _ in batch_of_tokens]
+
+        batch_size = len(batch_of_tokens)
+        max_len = max(len(s) for s in batch_of_tokens) if batch_of_tokens else 0
+        batch_arcs = [[] for _ in range(batch_size)]
+        batch_labels = [[] for _ in range(batch_size)]
+
+        for t in range(max_len):
+            active_indices, step_inputs = [], []
+            word_batch, left_ctx_batch, right_ctx_batch, lc_arc_label_history_batch = [], [], [], []
+            
+            for i in range(batch_size):
+                if t < len(batch_of_tokens[i]):
+                    active_indices.append(i)
+                    inputs_np = process_dp_input(
+                        t, batch_of_tokens[i], self.spu_tokenizer_word, self.tokenizer_label,
+                        self.arc_label_vector_len, batch_arcs[i], batch_labels[i]
+                    )
+                    word_batch.append(inputs_np[0])
+                    left_ctx_batch.append(inputs_np[1])
+                    right_ctx_batch.append(inputs_np[2])
+                    lc_arc_label_history_batch.append(inputs_np[3])
+
+            if not active_indices:
+                break
+
+            inputs_tf = [
+                tf.convert_to_tensor(np.vstack(word_batch)),
+                tf.convert_to_tensor(np.vstack(left_ctx_batch)),
+                tf.convert_to_tensor(np.vstack(right_ctx_batch)),
+                tf.convert_to_tensor(np.vstack(lc_arc_label_history_batch)),
+            ]
+
+            logits_batch = self.compiled_predict_step(*inputs_tf).numpy()
+            
+            for i, logits in enumerate(logits_batch):
+                original_index = active_indices[i]
+                arc, label = decode_arc_label_vector(logits, self.params_config['sentence_max_len'], self.label_vocab_size)
+                batch_arcs[original_index].append(arc)
+                batch_labels[original_index].append(label)
         
-        return [(i + 1, token, arcs[i], self.tokenizer_label.sequences_to_texts([[labels[i]]])[0] or "UNK")
-                for i, token in enumerate(tokens)]
+        final_results = []
+        for i in range(batch_size):
+            labels_str = self.tokenizer_label.sequences_to_texts([[lbl] for lbl in batch_labels[i]])
+            result = [(idx + 1, token, batch_arcs[i][idx], label or "UNK")
+                      for idx, (token, label) in enumerate(zip(batch_of_tokens[i], labels_str))]
+            final_results.append(result)
+
+        return final_results
+
 
 class TreeStackDP:
     """Implementation for the TreeStack Dependency Parser."""
@@ -184,27 +226,61 @@ class TreeStackDP:
         logger.info("TreeStackDP model initialized successfully.")
 
     def predict(self, tokens: List[str]) -> List[Tuple[int, str, int, str]]:
-        if not tokens: return []
-        
-        sentence_analyses = self.stemmer_analyzer.predict(tokens)
-        pos_results_tuples = self.pos_tagger.predict(tokens)
-        pos_tags = [tag for _, tag in pos_results_tuples]
-        
-        arcs, labels = [], []
-        for t in range(len(tokens)):
-            x_inputs = process_treestack_dp_input(
-                tokens, sentence_analyses, pos_tags, arcs, labels,
-                self.tokenizer_word, self.tokenizer_morph_tag, self.tokenizer_pos, self.tokenizer_label,
-                self.params['word_form'], self.params['sentence_max_len'], self.params['tag_max_len'],
-                self.arc_label_vector_len
-            )
-            logits = self.model(x_inputs, training=False).numpy()[0]
-            arc, label = decode_arc_label_vector(logits, self.params['sentence_max_len'], len(self.tokenizer_label.word_index))
-            arcs.append(arc)
-            labels.append(label)
+        if not tokens:
+            return []
+        return self.predict_batch([tokens])[0]
 
-        return [(i + 1, token, arcs[i], self.tokenizer_label.sequences_to_texts([[labels[i]]])[0] or "UNK")
-                for i, token in enumerate(tokens)]
+    def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[Tuple[int, str, int, str]]]:
+        if not any(batch_of_tokens):
+            return [[] for _ in batch_of_tokens]
+        
+        batch_size = len(batch_of_tokens)
+        max_len = max(len(s) for s in batch_of_tokens) if batch_of_tokens else 0
+        
+        # --- Run batched dependencies first ---
+        batch_analyses = self.stemmer_analyzer.predict_batch(batch_of_tokens)
+        batch_pos_results = self.pos_tagger.predict_batch(batch_of_tokens)
+        batch_pos_tags = [[tag for _, tag in sent_res] for sent_res in batch_pos_results]
+
+        batch_arcs = [[] for _ in range(batch_size)]
+        batch_labels = [[] for _ in range(batch_size)]
+
+        for t in range(max_len):
+            active_indices, step_inputs_list = [], []
+            
+            for i in range(batch_size):
+                if t < len(batch_of_tokens[i]):
+                    active_indices.append(i)
+                    inputs_np = process_treestack_dp_input(
+                        batch_of_tokens[i], batch_analyses[i], batch_pos_tags[i],
+                        batch_arcs[i], batch_labels[i],
+                        self.tokenizer_word, self.tokenizer_morph_tag, self.tokenizer_pos, self.tokenizer_label,
+                        self.params['word_form'], self.params['sentence_max_len'], self.params['tag_max_len'],
+                        self.arc_label_vector_len
+                    )
+                    step_inputs_list.append(inputs_np)
+            
+            if not active_indices:
+                break
+
+            stacked_inputs = [np.vstack([inputs[i] for inputs in step_inputs_list]) for i in range(len(step_inputs_list[0]))]
+            logits_batch = self.model(stacked_inputs, training=False).numpy()
+
+            for i, logits in enumerate(logits_batch):
+                original_index = active_indices[i]
+                arc, label = decode_arc_label_vector(logits, self.params['sentence_max_len'], len(self.tokenizer_label.word_index))
+                batch_arcs[original_index].append(arc)
+                batch_labels[original_index].append(label)
+        
+        final_results = []
+        for i in range(batch_size):
+            labels_str = self.tokenizer_label.sequences_to_texts([[lbl] for lbl in batch_labels[i]])
+            result = [(idx + 1, token, batch_arcs[i][idx], label or "UNK")
+                      for idx, (token, label) in enumerate(zip(batch_of_tokens[i], labels_str))]
+            final_results.append(result)
+            
+        return final_results
+
 
 class DependencyParser:
     """Main API class for Dependency Parser implementations."""
@@ -232,7 +308,71 @@ class DependencyParser:
         pos_result: List[Tuple[str, str]] = None
     ) -> Union[List[Tuple[int, str, int, str]], List[Dict]]:
         dp_result = self.instance.predict(tokens)
-        
         if displacy_format:
             return dp_pos_to_displacy_format(dp_result, pos_result)
         return dp_result
+
+    def predict_batch(
+        self, batch_of_tokens: List[List[str]]
+    ) -> List[List[Tuple[int, str, int, str]]]:
+        return self.instance.predict_batch(batch_of_tokens)
+
+
+def main():
+    """Demonstrates and tests the Dependency Parser module."""
+    from vnlp_colab.utils_colab import setup_logging
+    setup_logging()
+    logger.info("--- VNLP Colab Dependency Parser Test Suite ---")
+    
+    # --- SPUContextDP Tests ---
+    try:
+        logger.info("\n1. Testing SPUContextDP...")
+        parser_spu = DependencyParser(model='SPUContextDP')
+        tokens1 = TreebankWordTokenize("Onun için arkadaşlarımızı titizlikle seçeriz.")
+        
+        # Single prediction
+        result1 = parser_spu.predict(tokens=tokens1)
+        logger.info(f"   SPUContextDP Single Output: {result1}")
+        assert len(result1) == len(tokens1) and result1[4][2] == 0
+        
+        # Batch prediction
+        batch1 = [
+            TreebankWordTokenize("Onun için arkadaşlarımızı seçeriz."),
+            TreebankWordTokenize("Bu harika bir film.")
+        ]
+        batch_res1 = parser_spu.predict_batch(batch_of_tokens=batch1)
+        logger.info(f"   SPUContextDP Batch Output: {batch_res1}")
+        assert len(batch_res1) == 2
+        assert batch_res1[0][3][2] == 0 and batch_res1[1][3][2] == 0
+        logger.info("   SPUContextDP test PASSED.")
+    except Exception as e:
+        logger.error(f"   SPUContextDP test FAILED: {e}", exc_info=True)
+        
+    # --- TreeStackDP Tests ---
+    try:
+        logger.info("\n2. Testing TreeStackDP...")
+        parser_tree = DependencyParser(model='TreeStackDP')
+        tokens2 = TreebankWordTokenize("Onun için arkadaşlarımızı titizlikle seçeriz.")
+        
+        # Single prediction
+        result2 = parser_tree.predict(tokens=tokens2)
+        logger.info(f"   TreeStackDP Single Output: {result2}")
+        assert len(result2) == len(tokens2) and result2[4][2] == 0
+        
+        # Batch prediction
+        batch2 = [
+            TreebankWordTokenize("Onun için arkadaşlarımızı seçeriz."),
+            TreebankWordTokenize("Bu harika bir film."),
+            []
+        ]
+        batch_res2 = parser_tree.predict_batch(batch_of_tokens=batch2)
+        logger.info(f"   TreeStackDP Batch Output: {batch_res2}")
+        assert len(batch_res2) == 3
+        assert len(batch_res2[2]) == 0
+        assert batch_res2[0][3][2] == 0 and batch_res2[1][3][2] == 0
+        logger.info("   TreeStackDP test PASSED.")
+    except Exception as e:
+        logger.error(f"   TreeStackDP test FAILED: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    main()

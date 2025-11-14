@@ -19,14 +19,17 @@ Unified NLP Pipeline for VNLP Colab.
 
 This module provides a high-level API to run a sequence of NLP tasks on a
 dataset, including PoS tagging, NER, dependency parsing, sentiment analysis,
-and morphological analysis. It supports model selection and dependency chains.
+and morphological analysis. It is architected for high-performance, batched
+inference using tf.data.
 """
 import logging
 import re
+import time
 from pathlib import Path
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Generator, Tuple
 
 import pandas as pd
+import tensorflow as tf
 from tqdm.notebook import tqdm
 
 # Updated imports for package structure
@@ -45,7 +48,8 @@ tqdm.pandas()
 
 class VNLPipeline:
     """
-    Orchestrates a full NLP analysis pipeline for a given dataset.
+    Orchestrates a full NLP analysis pipeline for a given dataset, optimized
+    for high-throughput batch processing.
     """
     def __init__(self, models_to_load: List[str]):
         """
@@ -112,77 +116,143 @@ class VNLPipeline:
         return df
 
     def run_preprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
-        logger.info("Starting preprocessing...")
-        df['sentence'] = df['sentence'].progress_apply(
-            lambda s: re.sub(r'\s+', ' ', s).strip() if isinstance(s, str) else ""
-        )
+        logger.info("Starting preprocessing (using vectorized pandas operations)...")
+        df['sentence'] = df['sentence'].str.replace(r'\s+', ' ', regex=True).str.strip().fillna("")
         df.dropna(subset=['sentence'], inplace=True)
-        logger.info("Step 1/4: Cleaned 'sentence' column.")
+        logger.info("Step 1/3: Cleaned 'sentence' column.")
+        
         df['no_accents'] = df['sentence'].progress_apply(self.normalizer.remove_accent_marks)
-        logger.info("Step 2/4: Created 'no_accents' column.")
+        logger.info("Step 2/3: Created 'no_accents' column.")
+        
         df['tokens'] = df['no_accents'].progress_apply(TreebankWordTokenize)
-        logger.info("Step 3/4: Created 'tokens' column.")
-        df['tokens_40'] = df['tokens'].progress_apply(
-            lambda tokens: [tokens[i:i + 40] for i in range(0, len(tokens), 40)] if tokens else [[]]
-        )
-        logger.info("Step 4/4: Created 'tokens_40' column for Dependency Parser.")
+        logger.info("Step 3/3: Created 'tokens' column.")
         return df
 
-    def run_analysis(self, df: pd.DataFrame) -> pd.DataFrame:
-        logger.info("Starting NLP model analysis in dependency order...")
+    def _dataframe_generator(self, df: pd.DataFrame) -> Generator[Tuple[tf.Tensor, tf.Tensor], None, None]:
+        """A generator that yields data needed for batch processing."""
+        for _, row in df.iterrows():
+            yield (
+                tf.constant(row['tokens'], dtype=tf.string),
+                tf.constant(row['sentence'], dtype=tf.string)
+            )
 
+    def process_dataframe(self, df: pd.DataFrame, batch_size: int = 32) -> pd.DataFrame:
+        """
+        Processes a DataFrame using a high-performance tf.data batching pipeline.
+        """
+        logger.info(f"Starting NLP model analysis with batch size {batch_size}...")
+        
+        # --- tf.data Pipeline Setup ---
+        dataset = tf.data.Dataset.from_generator(
+            lambda: self._dataframe_generator(df),
+            output_signature=(
+                tf.TensorSpec(shape=(None,), dtype=tf.string),
+                tf.TensorSpec(shape=(), dtype=tf.string)
+            )
+        )
+        
+        dataset = dataset.padded_batch(
+            batch_size,
+            padded_shapes=([None], []), # Pad the tokens dimension, not the scalar sentence
+            padding_values=("<pad>", "")
+        )
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+        # --- Initialize result storage ---
+        all_results = {task: [] for task in self.models.keys()}
         if 'sentiment' in self.models:
-            logger.info("Running Sentiment Analysis...")
-            df['sentiment'] = df['no_accents'].progress_apply(self.models['sentiment'].predict_proba)
+            all_results['sentiment_proba'] = []
 
-        if 'stemmer' in self.models:
-            logger.info("Running Morphological Analysis...")
-            df['morph'] = df['tokens'].progress_apply(self.models['stemmer'].predict)
-            logger.info("Deriving Lemmas...")
-            df['lemma'] = df['morph'].progress_apply(
-                lambda morph_list: [m.split("+")[0] for m in morph_list if '+' in m]
-            )
-
-        if 'pos' in self.models:
-            logger.info(f"Running Part-of-Speech Tagging using {self.models['pos'].instance.__class__.__name__}...")
-            df['pos_tuples'] = df['tokens'].progress_apply(self.models['pos'].predict)
-            df['pos'] = df['pos_tuples'].progress_apply(lambda tuples: [tag for _, tag in tuples])
-        
-        if 'ner' in self.models:
-            logger.info(f"Running Named Entity Recognition using {self.models['ner'].instance.__class__.__name__}...")
-            df['ner'] = df.progress_apply(
-                lambda row: [tag for _, tag in self.models['ner'].predict(row['sentence'], row['tokens'])],
-                axis=1
-            )
-        
-        if 'dep' in self.models:
-            logger.info(f"Running Dependency Parsing using {self.models['dep'].instance.__class__.__name__}...")
-            def parse_sentence_batches(row):
-                full_result = []
-                pos_tuples = row.get('pos_tuples', [])
-                token_counter = 0
-                for batch_tokens in row['tokens_40']:
-                    if not batch_tokens: continue
-                    batch_pos_tuples = pos_tuples[token_counter : token_counter + len(batch_tokens)]
-                    token_counter += len(batch_tokens)
-                    batch_dp_result = self.models['dep'].predict(tokens=batch_tokens, pos_result=batch_pos_tuples)
-                    simplified_batch = [(head, label) for _, _, head, label in batch_dp_result]
-                    full_result.extend(simplified_batch)
-                return full_result
+        # --- Batch Processing Loop ---
+        num_batches = (len(df) + batch_size - 1) // batch_size
+        for batch_tokens_tf, batch_sentences_tf in tqdm(dataset, total=num_batches, desc="Processing Batches"):
+            # Convert tensors back to Python types for model processing
+            batch_tokens = [[tok.decode('utf-8') for tok in sent if tok.decode('utf-8') != '<pad>'] for sent in batch_tokens_tf.numpy()]
+            batch_sentences = [s.decode('utf-8') for s in batch_sentences_tf.numpy()]
             
-            df['dep'] = df.progress_apply(parse_sentence_batches, axis=1)
+            # --- Execute models in dependency order ---
+            if 'sentiment' in self.models:
+                sentiment_probs = self.models['sentiment'].predict_proba_batch(batch_sentences)
+                all_results['sentiment_proba'].extend(sentiment_probs)
 
-        if 'pos_tuples' in df.columns:
-            df = df.drop(columns=['pos_tuples'])
+            if 'stemmer' in self.models:
+                morph_results = self.models['stemmer'].predict_batch(batch_tokens)
+                all_results['stemmer'].extend(morph_results)
+
+            if 'pos' in self.models:
+                pos_results = self.models['pos'].predict_batch(batch_tokens)
+                all_results['pos'].extend(pos_results)
+            
+            if 'ner' in self.models:
+                ner_results = self.models['ner'].predict_batch(batch_sentences, batch_tokens)
+                all_results['ner'].extend(ner_results)
+            
+            if 'dep' in self.models:
+                dep_results = self.models['dep'].predict_batch(batch_tokens)
+                all_results['dep'].extend(dep_results)
+
+        # --- Assign results back to DataFrame ---
+        logger.info("Assigning batch results back to DataFrame...")
+        # Use .loc to ensure alignment with the (potentially sorted) index
+        df_index = df.index
+        
+        if 'sentiment_proba' in all_results:
+            df.loc[df_index, 'sentiment'] = all_results['sentiment_proba']
+
+        if 'stemmer' in all_results:
+            df.loc[df_index, 'morph'] = all_results['stemmer']
+            logger.info("Deriving Lemmas from morphological analysis...")
+            df['lemma'] = df['morph'].apply(
+                lambda morph_list: [m.split("+")[0] for m in morph_list if '+' in m] if isinstance(morph_list, list) else []
+            )
+
+        if 'pos' in all_results:
+            df.loc[df_index, 'pos_tuples'] = all_results['pos']
+            df['pos'] = df['pos_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
+        
+        if 'ner' in all_results:
+            df.loc[df_index, 'ner_tuples'] = all_results['ner']
+            df['ner'] = df['ner_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
+        
+        if 'dep' in all_results:
+            df.loc[df_index, 'dep_tuples'] = all_results['dep']
+            df['dep'] = df['dep_tuples'].apply(lambda tuples: [(head, label) for _, _, head, label in tuples] if isinstance(tuples, list) else [])
+
+        # Clean up intermediate tuple columns
+        cols_to_drop = [col for col in ['pos_tuples', 'ner_tuples', 'dep_tuples'] if col in df.columns]
+        if cols_to_drop:
+            df = df.drop(columns=cols_to_drop)
 
         logger.info("NLP model analysis complete.")
         return df
 
-    def run(self, csv_path: str, output_pickle_path: str) -> pd.DataFrame:
+    def run(self, csv_path: str, output_pickle_path: str, batch_size: int = 32) -> pd.DataFrame:
         """Executes the full pipeline: load, preprocess, analyze, and save."""
         df_initial = self.load_from_csv(csv_path, f"{Path(output_pickle_path).stem}.initial.pkl")
         df_preprocessed = self.run_preprocessing(df_initial)
-        df_final = self.run_analysis(df_preprocessed)
+        
+        # --- REFINEMENT: Sort by token length for efficient batching ---
+        logger.info("Optimizing batching efficiency by sorting data by sentence length...")
+        df_preprocessed['token_len'] = df_preprocessed['tokens'].str.len()
+        df_preprocessed.sort_values('token_len', inplace=True)
+        df_preprocessed.drop(columns=['token_len'], inplace=True)
+        # The original index is preserved, which we'll use to restore order later.
+        
+        start_time = time.time()
+        df_processed = self.process_dataframe(df_preprocessed, batch_size)
+        end_time = time.time()
+        
+        # --- REFINEMENT: Restore original order ---
+        logger.info("Restoring original sentence order...")
+        df_final = df_processed.sort_index()
+        
+        duration = end_time - start_time
+        rows_per_second = len(df_final) / duration if duration > 0 else float('inf')
+        
+        logger.info(f"--- Performance Summary ---")
+        logger.info(f"Total processing time: {duration:.2f} seconds for {len(df_final)} rows.")
+        logger.info(f"Throughput: {rows_per_second:.2f} rows/sec")
+        logger.info(f"--------------------------")
         
         logger.info(f"Saving final processed DataFrame to '{output_pickle_path}'...")
         df_final.to_pickle(output_pickle_path)

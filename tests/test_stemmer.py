@@ -14,9 +14,20 @@ def sample_tokens_stemmer() -> List[str]:
     """Provides a sample tokenized sentence for Stemmer/Morphological Analyzer tests."""
     return ["Üniversite", "sınavlarına", "canla", "başla", "çalışıyorlardı", "."]
 
+@pytest.fixture(scope="module")
+def sample_tokens_batch_stemmer() -> List[List[str]]:
+    """Provides a batch of tokenized sentences for testing batch prediction."""
+    return [
+        ["Benim", "adım", "Melikşah", "."],
+        ["Vapurla", "Beşiktaş'a", "geçip", "ulaştım", "."],
+        [], # Test case with an empty sentence
+        ["Bu", "sadece", "bir", "test", "."]
+    ]
+
+
 def test_stemmer_analyzer_predict(sample_tokens_stemmer: List[str]):
     """
-    Unit test for the StemmerAnalyzer model.
+    Unit test for the StemmerAnalyzer model's single predict method.
     Verifies output format, length, and the correctness of a few key analyses.
     """
     stemmer = get_stemmer_analyzer()
@@ -27,7 +38,6 @@ def test_stemmer_analyzer_predict(sample_tokens_stemmer: List[str]):
     assert all(isinstance(item, str) for item in result)
 
     # Validate specific, high-confidence morphological analyses
-    # These represent the model's expected disambiguation choice.
     expected_analyses = {
         "Üniversite": "üniversite+Noun+A3sg+Pnon+Nom",
         "sınavlarına": "sınav+Noun+A3pl+P3sg+Dat",
@@ -39,6 +49,30 @@ def test_stemmer_analyzer_predict(sample_tokens_stemmer: List[str]):
     result_dict = dict(zip(sample_tokens_stemmer, result))
     for token, expected_analysis in expected_analyses.items():
         assert result_dict.get(token) == expected_analysis
+
+def test_stemmer_analyzer_predict_batch(sample_tokens_batch_stemmer: List[List[str]]):
+    """
+    Unit test for the StemmerAnalyzer's batch prediction method.
+    Verifies output structure and correctness for a multi-sentence batch.
+    """
+    stemmer = get_stemmer_analyzer()
+    batch_result = stemmer.predict_batch(sample_tokens_batch_stemmer)
+
+    assert isinstance(batch_result, list)
+    assert len(batch_result) == len(sample_tokens_batch_stemmer)
+    
+    # Check dimensions and types
+    assert len(batch_result[0]) == 4
+    assert len(batch_result[1]) == 5
+    assert len(batch_result[2]) == 0
+    assert len(batch_result[3]) == 5
+    assert isinstance(batch_result[0][0], str)
+
+    # Validate specific analyses from different sentences in the batch
+    assert batch_result[0][2] == "melikşah+Noun+Prop+A3sg+Pnon+Nom"
+    assert batch_result[1][1] == "beşiktaş+Noun+Prop+A3sg+Pnon+Dat"
+    assert batch_result[3][3] == "test+Noun+A3sg+Pnon+Nom"
+
 
 def test_stemmer_analyzer_lemmas(sample_tokens_stemmer: List[str]):
     """

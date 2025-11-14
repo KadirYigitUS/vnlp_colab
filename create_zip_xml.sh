@@ -44,7 +44,7 @@ IGNORE_LIST=(
     "output"
     "retired"
     "backup"
-    "docs" # General docs, not the root .md files
+    "docs"
     "enhanced_output" # From previous runs
     "demo_output" # From previous runs
     "vnlp-custom"
