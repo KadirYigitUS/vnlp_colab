@@ -59,6 +59,8 @@ class VNLPipeline:
             models_to_load (List[str]): Models to init. Format: ['task'] or ['task:model_name'].
                 Examples: ['pos', 'ner', 'dep:TreeStackDP', 'stemmer', 'sentiment']
         """
+        # The setup_logging call is still useful for initial setup, but the user
+        # can now control the verbosity from their script.
         setup_logging()
         logger.info("Initializing VNLP Pipeline...")
         self.models: Dict[str, Any] = {}
@@ -119,7 +121,6 @@ class VNLPipeline:
         logger.info("Starting preprocessing (using vectorized pandas operations)...")
         df['sentence'] = df['sentence'].str.replace(r'\s+', ' ', regex=True).str.strip().fillna("")
         df.dropna(subset=['sentence'], inplace=True)
-        # Reset index after dropping rows to ensure it's contiguous for generator
         df.reset_index(drop=True, inplace=True)
         logger.info("Step 1/3: Cleaned 'sentence' column.")
         
@@ -186,7 +187,6 @@ class VNLPipeline:
         logger.info("Assigning batch results back to DataFrame...")
         df_index = df.index
         
-        # --- FIX: Convert ragged lists to pandas Series before assignment ---
         if 'sentiment_proba' in all_results:
             df.loc[df_index, 'sentiment'] = all_results['sentiment_proba']
 
@@ -222,10 +222,8 @@ class VNLPipeline:
         df_preprocessed = self.run_preprocessing(df_initial)
         
         logger.info("Optimizing batching efficiency by sorting data by sentence length...")
-        # Store original index before sorting
         original_index = df_preprocessed.index
         df_preprocessed['token_len'] = df_preprocessed['tokens'].str.len()
-        # Use a stable sort to maintain relative order of same-length sentences
         df_preprocessed.sort_values('token_len', inplace=True, kind='mergesort')
         df_preprocessed.drop(columns=['token_len'], inplace=True)
         
@@ -234,16 +232,16 @@ class VNLPipeline:
         end_time = time.time()
         
         logger.info("Restoring original sentence order...")
-        # Reindex based on the sorted df's index, then sort by original index order
         df_final = df_processed.reindex(original_index).sort_index()
         
         duration = end_time - start_time
         rows_per_second = len(df_final) / duration if duration > 0 else float('inf')
         
-        logger.info(f"--- Performance Summary ---")
-        logger.info(f"Total processing time: {duration:.2f} seconds for {len(df_final)} rows.")
-        logger.info(f"Throughput: {rows_per_second:.2f} rows/sec")
-        logger.info(f"--------------------------")
+        # --- FIX: Changed from logger.info to print() for guaranteed visibility ---
+        print("\n--- Performance Summary ---")
+        print(f"Total processing time: {duration:.2f} seconds for {len(df_final)} rows.")
+        print(f"Throughput: {rows_per_second:.2f} rows/sec")
+        print(f"--------------------------\n")
         
         logger.info(f"Saving final processed DataFrame to '{output_pickle_path}'...")
         df_final.to_pickle(output_pickle_path)
