@@ -119,6 +119,8 @@ class VNLPipeline:
         logger.info("Starting preprocessing (using vectorized pandas operations)...")
         df['sentence'] = df['sentence'].str.replace(r'\s+', ' ', regex=True).str.strip().fillna("")
         df.dropna(subset=['sentence'], inplace=True)
+        # Reset index after dropping rows to ensure it's contiguous for generator
+        df.reset_index(drop=True, inplace=True)
         logger.info("Step 1/3: Cleaned 'sentence' column.")
         
         df['no_accents'] = df['sentence'].progress_apply(self.normalizer.remove_accent_marks)
@@ -140,9 +142,12 @@ class VNLPipeline:
         """
         Processes a DataFrame using a high-performance tf.data batching pipeline.
         """
+        if df.empty:
+            logger.warning("Input DataFrame is empty. Skipping processing.")
+            return df
+            
         logger.info(f"Starting NLP model analysis with batch size {batch_size}...")
         
-        # --- tf.data Pipeline Setup ---
         dataset = tf.data.Dataset.from_generator(
             lambda: self._dataframe_generator(df),
             output_signature=(
@@ -153,72 +158,57 @@ class VNLPipeline:
         
         dataset = dataset.padded_batch(
             batch_size,
-            padded_shapes=([None], []), # Pad the tokens dimension, not the scalar sentence
+            padded_shapes=([None], []),
             padding_values=("<pad>", "")
         )
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
-        # --- Initialize result storage ---
         all_results = {task: [] for task in self.models.keys()}
         if 'sentiment' in self.models:
             all_results['sentiment_proba'] = []
 
-        # --- Batch Processing Loop ---
         num_batches = (len(df) + batch_size - 1) // batch_size
         for batch_tokens_tf, batch_sentences_tf in tqdm(dataset, total=num_batches, desc="Processing Batches"):
-            # Convert tensors back to Python types for model processing
             batch_tokens = [[tok.decode('utf-8') for tok in sent if tok.decode('utf-8') != '<pad>'] for sent in batch_tokens_tf.numpy()]
             batch_sentences = [s.decode('utf-8') for s in batch_sentences_tf.numpy()]
             
-            # --- Execute models in dependency order ---
             if 'sentiment' in self.models:
-                sentiment_probs = self.models['sentiment'].predict_proba_batch(batch_sentences)
-                all_results['sentiment_proba'].extend(sentiment_probs)
-
+                all_results['sentiment_proba'].extend(self.models['sentiment'].predict_proba_batch(batch_sentences))
             if 'stemmer' in self.models:
-                morph_results = self.models['stemmer'].predict_batch(batch_tokens)
-                all_results['stemmer'].extend(morph_results)
-
+                all_results['stemmer'].extend(self.models['stemmer'].predict_batch(batch_tokens))
             if 'pos' in self.models:
-                pos_results = self.models['pos'].predict_batch(batch_tokens)
-                all_results['pos'].extend(pos_results)
-            
+                all_results['pos'].extend(self.models['pos'].predict_batch(batch_tokens))
             if 'ner' in self.models:
-                ner_results = self.models['ner'].predict_batch(batch_sentences, batch_tokens)
-                all_results['ner'].extend(ner_results)
-            
+                all_results['ner'].extend(self.models['ner'].predict_batch(batch_sentences, batch_tokens))
             if 'dep' in self.models:
-                dep_results = self.models['dep'].predict_batch(batch_tokens)
-                all_results['dep'].extend(dep_results)
+                all_results['dep'].extend(self.models['dep'].predict_batch(batch_tokens))
 
-        # --- Assign results back to DataFrame ---
         logger.info("Assigning batch results back to DataFrame...")
-        # Use .loc to ensure alignment with the (potentially sorted) index
         df_index = df.index
         
+        # --- FIX: Convert ragged lists to pandas Series before assignment ---
         if 'sentiment_proba' in all_results:
             df.loc[df_index, 'sentiment'] = all_results['sentiment_proba']
 
         if 'stemmer' in all_results:
-            df.loc[df_index, 'morph'] = all_results['stemmer']
+            df.loc[df_index, 'morph'] = pd.Series(all_results['stemmer'], index=df_index)
             logger.info("Deriving Lemmas from morphological analysis...")
             df['lemma'] = df['morph'].apply(
                 lambda morph_list: [m.split("+")[0] for m in morph_list if '+' in m] if isinstance(morph_list, list) else []
             )
 
         if 'pos' in all_results:
-            df.loc[df_index, 'pos_tuples'] = all_results['pos']
+            df.loc[df_index, 'pos_tuples'] = pd.Series(all_results['pos'], index=df_index)
             df['pos'] = df['pos_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
         
         if 'ner' in all_results:
-            df.loc[df_index, 'ner_tuples'] = all_results['ner']
+            df.loc[df_index, 'ner_tuples'] = pd.Series(all_results['ner'], index=df_index)
             df['ner'] = df['ner_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
         
         if 'dep' in all_results:
-            df.loc[df_index, 'dep_tuples'] = all_results['dep']
+            df.loc[df_index, 'dep_tuples'] = pd.Series(all_results['dep'], index=df_index)
             df['dep'] = df['dep_tuples'].apply(lambda tuples: [(head, label) for _, _, head, label in tuples] if isinstance(tuples, list) else [])
 
-        # Clean up intermediate tuple columns
         cols_to_drop = [col for col in ['pos_tuples', 'ner_tuples', 'dep_tuples'] if col in df.columns]
         if cols_to_drop:
             df = df.drop(columns=cols_to_drop)
@@ -231,20 +221,21 @@ class VNLPipeline:
         df_initial = self.load_from_csv(csv_path, f"{Path(output_pickle_path).stem}.initial.pkl")
         df_preprocessed = self.run_preprocessing(df_initial)
         
-        # --- REFINEMENT: Sort by token length for efficient batching ---
         logger.info("Optimizing batching efficiency by sorting data by sentence length...")
+        # Store original index before sorting
+        original_index = df_preprocessed.index
         df_preprocessed['token_len'] = df_preprocessed['tokens'].str.len()
-        df_preprocessed.sort_values('token_len', inplace=True)
+        # Use a stable sort to maintain relative order of same-length sentences
+        df_preprocessed.sort_values('token_len', inplace=True, kind='mergesort')
         df_preprocessed.drop(columns=['token_len'], inplace=True)
-        # The original index is preserved, which we'll use to restore order later.
         
         start_time = time.time()
         df_processed = self.process_dataframe(df_preprocessed, batch_size)
         end_time = time.time()
         
-        # --- REFINEMENT: Restore original order ---
         logger.info("Restoring original sentence order...")
-        df_final = df_processed.sort_index()
+        # Reindex based on the sorted df's index, then sort by original index order
+        df_final = df_processed.reindex(original_index).sort_index()
         
         duration = end_time - start_time
         rows_per_second = len(df_final) / duration if duration > 0 else float('inf')
