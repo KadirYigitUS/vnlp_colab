@@ -40,7 +40,6 @@ _MODEL_CONFIGS = {
     'StemmerAnalyzer': {
         'weights_prod': ("Stemmer_Shen_prod.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/Stemmer_Shen_prod.weights"),
         'weights_eval': ("Stemmer_Shen_eval.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/Stemmer_Shen_eval.weights"),
-        # --- MODIFIED: These are now loaded directly from package resources ---
         'char_tokenizer': "Stemmer_char_tokenizer.json",
         'tag_tokenizer': "Stemmer_morph_tag_tokenizer.json",
         'params': {
@@ -79,12 +78,10 @@ class StemmerAnalyzer:
 
         self.capitalize_pnons = self.params.pop('capitalize_pnons', False)
 
-        # --- MODIFIED: Load local resources using get_resource_path ---
         resource_pkg_path = "vnlp_colab.stemmer.resources"
         char_tokenizer_path = get_resource_path(resource_pkg_path, config['char_tokenizer'])
         tag_tokenizer_path = get_resource_path(resource_pkg_path, config['tag_tokenizer'])
         
-        # Download only the heavyweight model weights
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
 
@@ -96,7 +93,6 @@ class StemmerAnalyzer:
         char_vocab_size = len(self.tokenizer_char.word_index) + 1
         tag_vocab_size = len(self.tokenizer_tag.word_index) + 1
 
-        # --- Build and Load Model ---
         self.model = create_stemmer_model(
             char_vocab_size=char_vocab_size,
             tag_vocab_size=tag_vocab_size,
@@ -129,55 +125,45 @@ class StemmerAnalyzer:
     def predict(self, tokens: List[str]) -> List[str]:
         """
         High-level API for Morphological Disambiguation on a single tokenized sentence.
-        
-        Args:
-            tokens (list): Input sentence tokens.
-
-        Returns:
-            List[str]: A list of the selected morphological analyses.
         """
-        # This method now delegates to the batch-processing method for consistency.
         if not tokens:
             return []
-        
         results = self.predict_batch([tokens])
         return results[0] if results else []
 
     def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[str]]:
         """
         High-performance API for Morphological Disambiguation on a batch of tokenized sentences.
-        
-        Args:
-            batch_of_tokens (List[List[str]]): A list of tokenized sentences.
-
-        Returns:
-            List[List[str]]: A list containing the analysis results for each sentence.
         """
         if not batch_of_tokens:
             return []
 
-        # --- 1. Flatten the batch and prepare for processing ---
         sentence_lengths = [len(tokens) for tokens in batch_of_tokens]
         flat_tokens = [token for sentence in batch_of_tokens for token in sentence]
 
         if not flat_tokens:
             return [[] for _ in batch_of_tokens]
 
-        # --- 2. Generate candidates and create model inputs for all tokens in one go ---
         data_for_processing = []
         for i, sentence_tokens in enumerate(batch_of_tokens):
             sentence_analyses = [self.candidate_generator.get_analysis_candidates(token) for token in sentence_tokens]
             data_for_processing.append((sentence_tokens, sentence_analyses))
 
+        # --- FIX: Call process_stemmer_input with explicit keyword arguments ---
+        # This resolves the TypeError by only passing the parameters the function expects.
         x_numpy, _ = process_stemmer_input(
-            data_for_processing, self.tokenizer_char, self.tokenizer_tag,
-            **self.params
+            data=data_for_processing,
+            tokenizer_char=self.tokenizer_char,
+            tokenizer_tag=self.tokenizer_tag,
+            stem_max_len=self.params['stem_max_len'],
+            tag_max_len=self.params['tag_max_len'],
+            surface_token_max_len=self.params['surface_token_max_len'],
+            sentence_max_len=self.params['sentence_max_len'],
+            num_max_analysis=self.params['num_max_analysis']
         )
-
-        # --- 3. Run model prediction on the entire batch of tokens ---
+        
         probs = self.compiled_predict_step(*x_numpy)
 
-        # --- 4. Decode results and reconstruct the batch structure ---
         flat_sentence_analyses = [analysis for _, sent_analyses in data_for_processing for analysis in sent_analyses]
         ambig_levels = np.array([len(a) for a in flat_sentence_analyses], dtype=np.int32)
         mask = tf.sequence_mask(ambig_levels, maxlen=self.params['num_max_analysis'], dtype=tf.float32)
@@ -196,7 +182,6 @@ class StemmerAnalyzer:
             else:
                 flat_final_result.append(flat_tokens[i] + "+Unknown")
         
-        # --- 5. Partition the flat results back into per-sentence lists ---
         batched_final_result = []
         current_pos = 0
         for length in sentence_lengths:
