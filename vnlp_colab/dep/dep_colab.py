@@ -78,7 +78,7 @@ class SPUContextDP:
     def __init__(self, evaluate: bool = False):
         logger.info(f"Initializing SPUContextDP model (evaluate={evaluate})...")
         config = _MODEL_CONFIGS['SPUContextDP']
-        self.params_config = config['params'] # Keep the original config for other uses
+        self.params_config = config['params'] 
         cache_dir = get_vnlp_cache_dir()
 
         spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
@@ -94,18 +94,19 @@ class SPUContextDP:
         self.arc_label_vector_len = self.params_config['sentence_max_len'] + 1 + self.label_vocab_size + 1
         word_embedding_matrix = np.load(embedding_path)
 
-        # --- MODIFIED: Create a clean copy for model creation ---
-        model_params = self.params_config.copy()
-        num_rnn_units = model_params.pop('word_embedding_dim') * model_params.pop('rnn_units_multiplier')
-        # Pop any other keys not in the create_model function signature
-        model_params.pop('sentence_max_len')
+        # --- MODIFIED: Explicitly pass arguments to prevent TypeErrors ---
+        params = self.params_config
+        num_rnn_units = params['word_embedding_dim'] * params['rnn_units_multiplier']
         
         self.model = create_spucontext_dp_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             arc_label_vector_len=self.arc_label_vector_len,
+            word_embedding_dim=params['word_embedding_dim'],
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
-            num_rnn_units=num_rnn_units, 
-            **model_params # Now this is safe
+            num_rnn_units=num_rnn_units,
+            num_rnn_stacks=params['num_rnn_stacks'],
+            fc_units_multiplier=params['fc_units_multiplier'],
+            dropout=params['dropout']
         )
         with open(weights_path, 'rb') as fp: model_weights = pickle.load(fp)
         self.model.set_weights([word_embedding_matrix] + model_weights)

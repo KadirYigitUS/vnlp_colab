@@ -79,6 +79,7 @@ class SPUContextNER:
     def __init__(self, evaluate: bool = False):
         logger.info(f"Initializing SPUContextNER model (evaluate={evaluate})...")
         config = _MODEL_CONFIGS['SPUContextNER']
+        params = config['params']
         cache_dir = get_vnlp_cache_dir()
 
         spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
@@ -94,16 +95,18 @@ class SPUContextNER:
         
         word_embedding_matrix = np.load(embedding_path)
         
-        # --- MODIFIED: Create a clean copy of params for model creation ---
-        model_params = config['params'].copy()
-        num_rnn_units = model_params.pop('word_embedding_dim') * model_params.pop('rnn_units_multiplier')
+        # --- MODIFIED: Explicitly pass arguments to prevent TypeErrors ---
+        num_rnn_units = params['word_embedding_dim'] * params['rnn_units_multiplier']
         
         self.model = create_spucontext_ner_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             entity_vocab_size=len(self.tokenizer_label.word_index),
+            word_embedding_dim=params['word_embedding_dim'],
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
-            num_rnn_units=num_rnn_units, 
-            **model_params # Now this is safe
+            num_rnn_units=num_rnn_units,
+            num_rnn_stacks=params['num_rnn_stacks'],
+            fc_units_multiplier=params['fc_units_multiplier'],
+            dropout=params['dropout']
         )
 
         with open(weights_path, 'rb') as fp:
