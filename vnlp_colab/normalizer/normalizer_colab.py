@@ -1,3 +1,4 @@
+# vnlp_colab/normalizer/normalizer_colab.py
 # coding=utf-8
 #
 # Copyright 2025 VNLP Project Authors.
@@ -17,23 +18,16 @@
 Full-featured, stateful Normalizer for VNLP Colab.
 
 This module provides a comprehensive Normalizer class with lazy-loading for heavy
-resources (dictionaries, lexicons) and dependency injection for the StemmerAnalyzer.
-It is designed for high-performance, repeated use within a pipeline.
+resources. It is designed for high-performance, repeated use within a pipeline.
 """
 import logging
 import re
 from typing import List, Optional, Dict
 from pathlib import Path
 
-# Try to import optional dependency spylls for typo correction
-try:
-    from spylls.hunspell import Dictionary
-except ImportError:
-    Dictionary = None
-
 # Updated imports for package structure
 from vnlp_colab.normalizer._deasciifier import Deasciifier
-from vnlp_colab.utils_colab import download_resource
+from vnlp_colab.utils_colab import get_resource_path
 from vnlp_colab.stemmer.stemmer_colab import StemmerAnalyzer
 
 # Forward-declare StemmerAnalyzer for type hinting to avoid circular import
@@ -42,10 +36,9 @@ class StemmerAnalyzer:
 
 logger = logging.getLogger(__name__)
 
-# --- Resource URLs ---
-LEXICON_URL = "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/resources/turkish_known_words_lexicon.txt"
-HUNSPELL_AFF_URL = "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/resources/tdd-hunspell-tr-1.1.0/tr_TR.aff"
-HUNSPELL_DIC_URL = "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/resources/tdd-hunspell-tr-1.1.0/tr_TR.dic"
+# --- Resource Constants ---
+LEXICON_PKG_PATH = "vnlp_colab.resources"
+LEXICON_FILENAME = "turkish_known_words_lexicon.txt"
 
 
 class Normalizer:
@@ -54,41 +47,25 @@ class Normalizer:
     """
     _LOWERCASE_MAP = { "İ": "i", "I": "ı", "Ğ": "ğ", "Ü": "ü", "Ö": "ö", "Ş": "ş", "Ç": "ç" }
     _ACCENT_MAP = { 'â':'a', 'ô':'o', 'î':'i', 'ê':'e', 'û':'u', 'Â':'A', 'Ô':'O', 'Î':'İ', 'Ê':'E', 'Û': 'U' }
-    _PUNCTUATION_CHARS = ".,!?;:'\""
 
     def __init__(self, stemmer_analyzer_instance: Optional[StemmerAnalyzer] = None):
         self._words_lexicon: Optional[Dict[str, None]] = None
-        self._stemmer_analyzer: Optional[StemmerAnalyzer] = None
-        self._dictionary: Optional['Dictionary'] = None
-        self._shared_stemmer_analyzer = stemmer_analyzer_instance
+        # --- REMOVED: Defunct typo correction attributes ---
+        # self._stemmer_analyzer: Optional[StemmerAnalyzer] = None
+        # self._dictionary: Optional['Dictionary'] = None
+        # self._shared_stemmer_analyzer = stemmer_analyzer_instance
 
     # --- Private Lazy Loaders ---
     def _load_lexicon(self):
         if self._words_lexicon is None:
             logger.info("Lazy-loading Turkish known words lexicon...")
-            lexicon_path = download_resource("turkish_known_words_lexicon.txt", LEXICON_URL)
+            lexicon_path = get_resource_path(LEXICON_PKG_PATH, LEXICON_FILENAME)
             with open(lexicon_path, 'r', encoding='utf-8') as f:
                 self._words_lexicon = dict.fromkeys(line.strip() for line in f)
 
-    def _load_dictionary(self):
-        if self._dictionary is None:
-            if Dictionary is None:
-                logger.warning("`spylls` not installed. Typo correction is disabled. Run 'pip install spylls'.")
-                return
-            logger.info("Lazy-loading Hunspell dictionary...")
-            aff_path = download_resource("tr_TR.aff", HUNSPELL_AFF_URL)
-            dic_path = download_resource("tr_TR.dic", HUNSPELL_DIC_URL)
-            self._dictionary = Dictionary.from_files(str(dic_path.parent / 'tr_TR'))
-
-    def _load_stemmer_analyzer(self):
-        if self._stemmer_analyzer is None:
-            logger.info("Lazy-loading StemmerAnalyzer for typo correction...")
-            if self._shared_stemmer_analyzer:
-                self._stemmer_analyzer = self._shared_stemmer_analyzer
-            else:
-                # Late import to prevent circular dependency
-                from stemmer_colab import get_stemmer_analyzer
-                self._stemmer_analyzer = get_stemmer_analyzer()
+    # --- REMOVED: Defunct lazy-loaders for typo correction ---
+    # def _load_dictionary(self): ...
+    # def _load_stemmer_analyzer(self): ...
 
     # --- Static Methods ---
     @staticmethod
@@ -115,56 +92,12 @@ class Normalizer:
         return [Deasciifier(token).convert_to_turkish() for token in tokens]
 
     # --- Stateful Methods ---
-    def correct_typos(self, tokens: List[str]) -> List[str]:
-        """
-        Note: This function was historically removed from VNLP due to packaging
-        issues, as noted in GitHub issue #18. This version re-implements it
-        using `spylls` and integrates it with other VNLP components.
-        """
-        self._load_dictionary()
-        self._load_stemmer_analyzer()
-        self._load_lexicon()
-
-        if not self._dictionary or not self._stemmer_analyzer or not self._words_lexicon:
-            logger.warning("Typo correction dependencies not fully loaded. Skipping correction.")
-            return tokens
-
-        corrected_tokens = []
-        for token in tokens:
-            l_punct, core_word, t_punct = self._strip_punctuation(token)
-            if not core_word:
-                corrected_tokens.append(token)
-                continue
-
-            analysis = self._stemmer_analyzer.candidate_generator.get_analysis_candidates(core_word)
-            is_valid_by_stemmer = (analysis and analysis[0] and 'Unknown' not in analysis[0][2])
-            is_known = (core_word.isnumeric() or
-                        self._dictionary.lookup(core_word) or
-                        self._dictionary.lookup(core_word.lower()) or
-                        core_word in self._words_lexicon or
-                        core_word.lower() in self._words_lexicon or
-                        is_valid_by_stemmer)
-
-            if is_known:
-                corrected_tokens.append(token)
-            else:
-                suggestions = list(self._dictionary.suggest(core_word))
-                corrected_word = suggestions[0] if suggestions else core_word
-                corrected_tokens.append(l_punct + corrected_word + t_punct)
-                
-        return corrected_tokens
-
-    def _strip_punctuation(self, token: str) -> tuple[str, str, str]:
-        """Separates leading/trailing punctuation from a core word."""
-        leading_punct = ""
-        while token and token[0] in self._PUNCTUATION_CHARS:
-            leading_punct += token[0]
-            token = token[1:]
-        trailing_punct = ""
-        while token and token[-1] in self._PUNCTUATION_CHARS:
-            trailing_punct = token[-1] + trailing_punct
-            token = token[:-1]
-        return leading_punct, token, trailing_punct
+    # --- REMOVED: Defunct typo correction method ---
+    # Note: The `correct_typos` function was removed due to packaging and
+    # dependency issues with `spylls`, as noted in GitHub issue #18. It is
+    # not part of the stable v2.0 release.
+    # def correct_typos(self, tokens: List[str]) -> List[str]: ...
+    # def _strip_punctuation(self, token: str) -> tuple[str, str, str]: ...
 
     def convert_numbers_to_words(self, tokens: List[str], num_dec_digits: int = 6, decimal_separator: str = ',') -> List[str]:
         converted_tokens = []

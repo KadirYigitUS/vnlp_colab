@@ -1,3 +1,4 @@
+# vnlp_colab/stemmer/stemmer_colab.py
 # coding=utf-8
 #
 # Copyright 2025 VNLP Project Authors.
@@ -28,7 +29,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 # Updated imports for package structure
-from vnlp_colab.utils_colab import download_resource, load_keras_tokenizer, get_vnlp_cache_dir
+from vnlp_colab.utils_colab import download_resource, load_keras_tokenizer, get_vnlp_cache_dir, get_resource_path
 from vnlp_colab.stemmer.stemmer_utils_colab import create_stemmer_model, process_stemmer_input
 from vnlp_colab.stemmer._yildiz_analyzer import get_candidate_generator_instance, capitalize
 
@@ -39,8 +40,9 @@ _MODEL_CONFIGS = {
     'StemmerAnalyzer': {
         'weights_prod': ("Stemmer_Shen_prod.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/Stemmer_Shen_prod.weights"),
         'weights_eval': ("Stemmer_Shen_eval.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/Stemmer_Shen_eval.weights"),
-        'char_tokenizer': ("Stemmer_char_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/stemmer_morph_analyzer/resources/Stemmer_char_tokenizer.json"),
-        'tag_tokenizer': ("Stemmer_morph_tag_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/stemmer_morph_analyzer/resources/Stemmer_morph_tag_tokenizer.json"),
+        # --- MODIFIED: These are now loaded directly from package resources ---
+        'char_tokenizer': "Stemmer_char_tokenizer.json",
+        'tag_tokenizer': "Stemmer_morph_tag_tokenizer.json",
         'params': {
             'num_max_analysis': 10, 'stem_max_len': 10, 'tag_max_len': 15,
             'sentence_max_len': 40, 'surface_token_max_len': 15,
@@ -64,8 +66,6 @@ class StemmerAnalyzer:
     The underlying model is an implementation of "The Role of Context in Neural
     Morphological Disambiguation", optimized for Keras 3 and Colab.
     """
-# In vnlp_colab/stemmer/stemmer_colab.py
-
     def __init__(self, evaluate: bool = False):
         """
         Initializes the model, loads all necessary resources, and compiles the
@@ -74,17 +74,19 @@ class StemmerAnalyzer:
         """
         logger.info(f"Initializing StemmerAnalyzer model (evaluate={evaluate})...")
         config = _MODEL_CONFIGS['StemmerAnalyzer']
-        self.params = config['params']
+        self.params = config['params'].copy() # Use copy to safely pop
         cache_dir = get_vnlp_cache_dir()
 
-        # --- FIX: Isolate the post-processing parameter ---
         self.capitalize_pnons = self.params.pop('capitalize_pnons', False)
 
-        # --- Download and Load Resources ---
+        # --- MODIFIED: Load local resources using get_resource_path ---
+        resource_pkg_path = "vnlp_colab.stemmer.resources"
+        char_tokenizer_path = get_resource_path(resource_pkg_path, config['char_tokenizer'])
+        tag_tokenizer_path = get_resource_path(resource_pkg_path, config['tag_tokenizer'])
+        
+        # Download only the heavyweight model weights
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
-        char_tokenizer_path = download_resource(*config['char_tokenizer'], cache_dir)
-        tag_tokenizer_path = download_resource(*config['tag_tokenizer'], cache_dir)
 
         self.tokenizer_char = load_keras_tokenizer(char_tokenizer_path)
         self.tokenizer_tag = load_keras_tokenizer(tag_tokenizer_path)
@@ -95,7 +97,6 @@ class StemmerAnalyzer:
         tag_vocab_size = len(self.tokenizer_tag.word_index) + 1
 
         # --- Build and Load Model ---
-        # The **self.params call is now safe because 'capitalize_pnons' has been removed.
         self.model = create_stemmer_model(
             char_vocab_size=char_vocab_size,
             tag_vocab_size=tag_vocab_size,
@@ -169,7 +170,6 @@ class StemmerAnalyzer:
             pred_idx = predicted_indices[i]
             if pred_idx < len(analyses):
                 root, _, tags = analyses[pred_idx]
-                # --- FIX: Use the instance attribute directly ---
                 if "Prop" in tags and self.capitalize_pnons:
                     root = capitalize(root)
                 analysis_str = "+".join([root] + tags).replace('+DB', '^DB')

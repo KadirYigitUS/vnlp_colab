@@ -1,3 +1,4 @@
+# vnlp_colab/pipeline_colab.py
 # coding=utf-8
 #
 # Copyright 2025 VNLP Project Authors.
@@ -35,7 +36,7 @@ from vnlp_colab.normalizer.normalizer_colab import Normalizer
 from vnlp_colab.pos.pos_colab import PoSTagger
 from vnlp_colab.ner.ner_colab import NamedEntityRecognizer
 from vnlp_colab.dep.dep_colab import DependencyParser
-from vnlp_colab.stemmer.stemmer_colab import StemmerAnalyzer, get_stemmer_analyzer
+from vnlp_colab.stemmer.stemmer_colab import get_stemmer_analyzer
 from vnlp_colab.sentiment.sentiment_colab import SentimentAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -72,13 +73,12 @@ class VNLPipeline:
             if task == 'pos' and model_name == 'TreeStackPoS':
                 resolved_models.add('stemmer')
 
-        # Create a clean map for loading        
         for model_str in resolved_models:
             parts = model_str.split(':')
             task, model_name = (parts[0], parts[1]) if len(parts) > 1 else (parts[0], None)
             model_map[task] = model_name
 
-        logger.info(f"Resolved model loading order: {model_map}")
+        logger.info(f"Resolved model loading order: {list(model_map.keys())}")
 
         # --- Model Loading with Dependency Injection ---
         if 'stemmer' in model_map:
@@ -116,13 +116,14 @@ class VNLPipeline:
         df['sentence'] = df['sentence'].progress_apply(
             lambda s: re.sub(r'\s+', ' ', s).strip() if isinstance(s, str) else ""
         )
+        df.dropna(subset=['sentence'], inplace=True)
         logger.info("Step 1/4: Cleaned 'sentence' column.")
         df['no_accents'] = df['sentence'].progress_apply(self.normalizer.remove_accent_marks)
         logger.info("Step 2/4: Created 'no_accents' column.")
         df['tokens'] = df['no_accents'].progress_apply(TreebankWordTokenize)
         logger.info("Step 3/4: Created 'tokens' column.")
         df['tokens_40'] = df['tokens'].progress_apply(
-            lambda tokens: [tokens[i:i + 40] for i in range(0, len(tokens), 40)] if tokens else []
+            lambda tokens: [tokens[i:i + 40] for i in range(0, len(tokens), 40)] if tokens else [[]]
         )
         logger.info("Step 4/4: Created 'tokens_40' column for Dependency Parser.")
         return df
@@ -130,7 +131,6 @@ class VNLPipeline:
     def run_analysis(self, df: pd.DataFrame) -> pd.DataFrame:
         logger.info("Starting NLP model analysis in dependency order...")
 
-        # --- Models are run in a fixed order to satisfy dependencies ---
         if 'sentiment' in self.models:
             logger.info("Running Sentiment Analysis...")
             df['sentiment'] = df['no_accents'].progress_apply(self.models['sentiment'].predict_proba)
@@ -151,7 +151,7 @@ class VNLPipeline:
         if 'ner' in self.models:
             logger.info(f"Running Named Entity Recognition using {self.models['ner'].instance.__class__.__name__}...")
             df['ner'] = df.progress_apply(
-                lambda row: [tag for _, tag in self.models['ner'].predict(row['no_accents'], row['tokens'])],
+                lambda row: [tag for _, tag in self.models['ner'].predict(row['sentence'], row['tokens'])],
                 axis=1
             )
         
@@ -160,9 +160,6 @@ class VNLPipeline:
             def parse_sentence_batches(row):
                 full_result = []
                 pos_tuples = row.get('pos_tuples', [])
-                if not pos_tuples:
-                    pos_tuples = [(token, "X") for token in row['tokens']]
-
                 token_counter = 0
                 for batch_tokens in row['tokens_40']:
                     if not batch_tokens: continue
@@ -175,7 +172,6 @@ class VNLPipeline:
             
             df['dep'] = df.progress_apply(parse_sentence_batches, axis=1)
 
-        # Clean up intermediate columns        
         if 'pos_tuples' in df.columns:
             df = df.drop(columns=['pos_tuples'])
 
@@ -192,36 +188,3 @@ class VNLPipeline:
         df_final.to_pickle(output_pickle_path)
         logger.info("Pipeline execution finished successfully.")
         return df_final
-
-if __name__ == "__main__":
-    logger.info("--- VNLP Colab Pipeline Standalone Test ---")
-    
-    dummy_data = (
-        "novel01\t1\t1\t1\tBu film harikaydı, çok beğendim.\n"
-        "novel01\t1\t1\t2\tBenim adım Melikşah ve İstanbul'da yaşıyorum.\n"
-        "novel01\t1\t2\t1\tZamanımı boşa harcadığımı düşünüyorum.\n"
-    )
-    csv_path = Path("/content/dummy_input.csv")
-    csv_path.write_text(dummy_data, encoding='utf-8')
-    logger.info(f"Created dummy data at '{csv_path}'")
-
-    # --- Test 1: Full Pipeline (SPUContext Defaults) ---
-    logger.info("\n--- Running Test 1: Full SPUContext Pipeline ---")
-    spu_models = ['pos', 'ner', 'dep', 'stemmer', 'sentiment']
-    spu_pipeline = VNLPipeline(models_to_load=spu_models)
-    spu_output_path = "/content/spu_output.pkl"
-    spu_df = spu_pipeline.run(csv_path=str(csv_path), output_pickle_path=spu_output_path)
-
-    print("\n--- SPUContext Pipeline Final DataFrame ---")
-    pd.set_option('display.max_columns', None); pd.set_option('display.expand_frame_repr', False)
-    print(spu_df.head())
-
-    # --- Test 2: TreeStack Dependency Pipeline ---
-    logger.info("\n--- Running Test 2: TreeStack Pipeline ---")
-    treestack_models = ['dep:TreeStackDP', 'ner', 'sentiment']
-    tree_pipeline = VNLPipeline(models_to_load=treestack_models)
-    tree_output_path = "/content/treestack_output.pkl"
-    tree_df = tree_pipeline.run(csv_path=str(csv_path), output_pickle_path=tree_output_path)
-    
-    print("\n--- TreeStack Pipeline Final DataFrame ---")
-    print(tree_df.head())

@@ -1,3 +1,4 @@
+# vnlp_colab/utils_colab.py
 # coding=utf-8
 #
 # Copyright 2025 VNLP Project Authors.
@@ -17,11 +18,10 @@
 Core utilities for the VNLP package, refactored for Google Colab.
 
 This module provides essential functions for resource management (downloading,
-caching), environment setup (hardware detection, logging), and modern Keras 3 /
-TensorFlow compatibility. It is designed to be the backbone of the vnlp_colab
-package, ensuring efficient and maintainable execution.
+caching, local package file access), environment setup, and modern Keras 3 /
+TensorFlow compatibility.
 
-- Version: 1.0.0
+- Version: 2.0.0
 - Keras: 3.x
 - TensorFlow: 2.16+
 - Python: 3.10+
@@ -32,6 +32,13 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
+# --- NEW: Added importlib.resources for robust package data access ---
+try:
+    import importlib.resources as pkg_resources
+except ImportError:
+    # Fallback for Python < 3.9
+    import importlib_resources as pkg_resources
+
 import numpy as np
 import requests
 import tensorflow as tf
@@ -39,7 +46,7 @@ from tqdm.notebook import tqdm
 
 # --- Environment and Logging Setup ---
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 logger = logging.getLogger(__name__)
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -103,7 +110,6 @@ def detect_hardware_strategy() -> tf.distribute.Strategy:
         return tf.distribute.MirroredStrategy()
 
     logger.info("Single GPU found. Using OneDeviceStrategy.")
-    # Set memory growth to avoid allocating all GPU memory at once
     for gpu in gpus:
         try:
             tf.config.experimental.set_memory_growth(gpu, True)
@@ -112,6 +118,32 @@ def detect_hardware_strategy() -> tf.distribute.Strategy:
     return tf.distribute.OneDeviceStrategy(device="/gpu:0")
 
 # --- Resource Management ---
+
+def get_resource_path(package_path: str, resource_name: str) -> Path:
+    """
+    Gets the path to a resource file within the installed package.
+
+    This is the robust way to access package data, avoiding issues with
+    __file__ and working directories.
+
+    Args:
+        package_path (str): The dot-separated Python path to the package/module
+            containing the resource (e.g., 'vnlp_colab.stemmer.resources').
+        resource_name (str): The name of the file.
+
+    Returns:
+        Path: A Path object pointing to the resource file.
+    
+    Raises:
+        FileNotFoundError: If the resource cannot be found in the package.
+    """
+    try:
+        with pkg_resources.path(package_path, resource_name) as path:
+            return path
+    except FileNotFoundError:
+        logger.error(f"Resource '{resource_name}' not found in package '{package_path}'.")
+        raise
+
 
 def download_resource(
     file_name: str,
@@ -136,6 +168,7 @@ def download_resource(
     Raises:
         requests.exceptions.RequestException: If the download fails.
     """
+
     if cache_dir is None:
         cache_dir = get_vnlp_cache_dir()
     else:
@@ -152,7 +185,6 @@ def download_resource(
     try:
         with requests.get(file_url, stream=True) as response:
             response.raise_for_status()
-            # Use .get('content-length', '0') to safely handle missing header
             total_size = int(response.headers.get('content-length', 0))
             block_size = 1024  # 1 KB
 
@@ -161,20 +193,18 @@ def download_resource(
                 unit='iB',
                 unit_scale=True,
                 desc=f"Downloading {file_name}",
-                disable=total_size == 0 # Disable bar if total size is unknown
+                disable=total_size == 0
             ) as progress_bar:
                 for data in response.iter_content(block_size):
                     progress_bar.update(len(data))
                     f.write(data)
 
-            # --- FIX: Only warn if content-length was provided and doesn't match ---
             if total_size > 0 and progress_bar.n != total_size:
                 logger.warning(f"Download of '{file_name}' might be incomplete. "
                                f"Expected {total_size} bytes, got {progress_bar.n} bytes.")
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to download '{file_name}': {e}")
-        # Clean up partial download
         if file_path.exists():
             file_path.unlink()
         raise
@@ -230,7 +260,6 @@ def create_rnn_stacks(
         raise ValueError("num_rnn_stacks must be at least 1.")
 
     rnn_layers = []
-    # All but the last layer should return sequences
     for _ in range(num_rnn_stacks - 1):
         rnn_layers.append(
             tf.keras.layers.GRU(
@@ -240,7 +269,6 @@ def create_rnn_stacks(
                 go_backwards=go_backwards
             )
         )
-    # The last layer returns only the final state
     rnn_layers.append(
         tf.keras.layers.GRU(
             num_rnn_units,
@@ -316,7 +344,10 @@ def process_word_context(
     num_left_pad = sentence_max_len - len(left_context_processed)
     if num_left_pad > 0:
         padding = np.zeros((num_left_pad, token_piece_max_len), dtype=np.int32)
-        left_context_processed = np.vstack((padding, left_context_processed))
+        if len(left_context_processed) > 0:
+            left_context_processed = np.vstack((padding, left_context_processed))
+        else:
+            left_context_processed = padding
     elif num_left_pad < 0:
         left_context_processed = left_context_processed[-sentence_max_len:]
 
@@ -329,7 +360,10 @@ def process_word_context(
     num_right_pad = sentence_max_len - len(right_context_processed)
     if num_right_pad > 0:
         padding = np.zeros((num_right_pad, token_piece_max_len), dtype=np.int32)
-        right_context_processed = np.vstack((right_context_processed, padding))
+        if len(right_context_processed) > 0:
+            right_context_processed = np.vstack((right_context_processed, padding))
+        else:
+            right_context_processed = padding
     elif num_right_pad < 0:
         right_context_processed = right_context_processed[:sentence_max_len]
 
@@ -363,14 +397,17 @@ def main() -> None:
         logger.info(f"   Cached path: {license_path_cached}")
     except Exception as e:
         logger.error(f"   Download test failed: {e}")
+    
+    # 3. Test Package Resource Loading
+    logger.info("\n3. Testing Package Resource Loading:")
+    try:
+        # This will only work if the package is installed
+        path = get_resource_path('vnlp_colab.stemmer.resources', 'ExactLookup.txt')
+        logger.info(f"   Successfully found package resource: {path}")
+        assert path.exists()
+    except Exception as e:
+        logger.warning(f"   Could not find package resource. This is expected if package is not installed. Error: {e}")
 
-    # 3. Test Usage Snippet
-    logger.info("\n3. Example Usage Snippet:")
-    print("\nfrom utils_colab import setup_logging, download_resource, detect_hardware_strategy")
-    print("setup_logging()")
-    print("strategy = detect_hardware_strategy()")
-    print("# model = load_model(strategy) # In your model loading script")
-    print("# print(preprocess_text('Sample input for VNLP'))")
 
 if __name__ == "__main__":
     main()

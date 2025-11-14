@@ -1,3 +1,4 @@
+# vnlp_colab/sentiment/sentiment_colab.py
 # coding=utf-8
 #
 # Copyright 2025 VNLP Project Authors.
@@ -30,7 +31,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 # Updated imports for package structure
-from vnlp_colab.utils_colab import download_resource, get_vnlp_cache_dir
+from vnlp_colab.utils_colab import download_resource, get_vnlp_cache_dir, get_resource_path
 from vnlp_colab.sentiment.sentiment_utils_colab import create_spucbigru_sentiment_model, process_sentiment_input
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ _MODEL_CONFIGS = {
         'weights_prod': ("Sentiment_SPUCBiGRU_prod.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/Sentiment_SPUCBiGRU_prod.weights"),
         'weights_eval': ("Sentiment_SPUCBiGRU_eval.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/Sentiment_SPUCBiGRU_eval.weights"),
         'word_embedding_matrix': ("SPUTokenized_word_embedding_16k.matrix", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/SPUTokenized_word_embedding_16k.matrix"),
-        'spu_tokenizer': ("SPU_word_tokenizer_16k.model", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/resources/SPU_word_tokenizer_16k.model"),
+        'spu_tokenizer': "SPU_word_tokenizer_16k.model",
         'params': {
             'text_max_len': 256,
             'word_embedding_dim': 128,
@@ -67,11 +68,13 @@ class SPUCBiGRUSentimentAnalyzer:
         self.params = config['params']
         cache_dir = get_vnlp_cache_dir()
 
-        # Download and load resources
+        # --- MODIFIED: Load local resources using get_resource_path ---
+        spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
+        
+        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
-        spu_tokenizer_path = download_resource(*config['spu_tokenizer'], cache_dir)
 
         self.spu_tokenizer_word = spm.SentencePieceProcessor(model_file=str(spu_tokenizer_path))
         word_embedding_matrix = np.load(embedding_path)
@@ -106,6 +109,8 @@ class SPUCBiGRUSentimentAnalyzer:
 
     def predict_proba(self, text: str) -> float:
         """Predicts the sentiment probability for a given text."""
+        if not isinstance(text, str) or not text.strip():
+            return 0.5 # Return neutral for empty or invalid input
         processed_input = process_sentiment_input(text, self.spu_tokenizer_word, self.params['text_max_len'])
         prob = self.compiled_predict(tf.constant(processed_input)).numpy()[0][0]
         return float(prob)
@@ -147,7 +152,7 @@ class SentimentAnalyzer:
 # --- Main Entry Point for Standalone Use ---
 def main():
     """Demonstrates and tests the Sentiment Analyzer module."""
-    from utils_colab import setup_logging
+    from vnlp_colab.utils_colab import setup_logging
     setup_logging()
     
     logger.info("--- VNLP Colab Sentiment Analyzer Test Suite ---")

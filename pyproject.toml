@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vnlp_colab"
-version = "1.0.0"
+version = "2.0.1" # Incremented patch version for the fix
 authors = [
   { name="VNLP Project Authors" },
 ]
@@ -27,7 +27,6 @@ dependencies = [
     "numpy>=1.26.0",
     "pandas>=2.0.0",
     "sentencepiece==0.2.1",
-    "spylls>=0.1.5",
     "tqdm>=4.62.0",
     "regex>=2023.6.3",
     "requests>=2.28.0",
@@ -36,3 +35,13 @@ dependencies = [
 [project.urls]
 "Homepage" = "https://github.com/vngrs-ai/vnlp"
 "Bug Tracker" = "https://github.com/vngrs-ai/vnlp/issues"
+
+[tool.setuptools]
+packages = ["vnlp_colab", "vnlp_colab.dep", "vnlp_colab.ner", "vnlp_colab.normalizer", "vnlp_colab.pos", "vnlp_colab.sentiment", "vnlp_colab.stemmer"]
+
+[tool.setuptools.package-data]
+"vnlp_colab.dep.resources" = ["*.json"]
+"vnlp_colab.ner.resources" = ["*.json"]
+"vnlp_colab.pos.resources" = ["*.json"]
+"vnlp_colab.stemmer.resources" = ["*.txt", "*.json"]
+"vnlp_colab.resources" = ["*.txt", "*.model"] 

@@ -1,3 +1,4 @@
+# vnlp_colab/dep/dep_colab.py
 # coding=utf-8
 #
 # Copyright 2025 VNLP Project Authors.
@@ -30,7 +31,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 # Updated imports for package structure
-from vnlp_colab.utils_colab import download_resource, load_keras_tokenizer, get_vnlp_cache_dir
+from vnlp_colab.utils_colab import download_resource, load_keras_tokenizer, get_vnlp_cache_dir, get_resource_path
 from vnlp_colab.dep.dep_utils_colab import (
     create_spucontext_dp_model, process_dp_input,
     decode_arc_label_vector, dp_pos_to_displacy_format
@@ -49,18 +50,18 @@ _MODEL_CONFIGS = {
         'weights_prod': ("DP_SPUContext_prod.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/DP_SPUContext_prod.weights"),
         'weights_eval': ("DP_SPUContext_eval.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/DP_SPUContext_eval.weights"),
         'word_embedding_matrix': ("SPUTokenized_word_embedding_16k.matrix", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/SPUTokenized_word_embedding_16k.matrix"),
-        'spu_tokenizer': ("SPU_word_tokenizer_16k.model", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/resources/SPU_word_tokenizer_16k.model"),
-        'label_tokenizer': ("DP_label_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/dependency_parser/resources/DP_label_tokenizer.json"),
+        'spu_tokenizer': "SPU_word_tokenizer_16k.model",
+        'label_tokenizer': "DP_label_tokenizer.json",
         'params': {'sentence_max_len': 40, 'word_embedding_dim': 128, 'num_rnn_stacks': 2, 'rnn_units_multiplier': 2, 'fc_units_multiplier': (2, 1), 'dropout': 0.2}
     },
     'TreeStackDP': {
         'weights_prod': ("DP_TreeStack_prod.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/DP_TreeStack_prod.weights"),
         'weights_eval': ("DP_TreeStack_eval.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/DP_TreeStack_eval.weights"),
         'word_embedding_matrix': ("TBWTokenized_word_embedding.matrix", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/TBWTokenized_word_embedding.matrix"),
-        'word_tokenizer': ("TB_word_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/resources/TB_word_tokenizer.json"),
-        'morph_tag_tokenizer': ("Stemmer_morph_tag_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/stemmer_morph_analyzer/resources/Stemmer_morph_tag_tokenizer.json"),
-        'pos_label_tokenizer': ("PoS_label_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/part_of_speech_tagger/resources/PoS_label_tokenizer.json"),
-        'dp_label_tokenizer': ("DP_label_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/dependency_parser/resources/DP_label_tokenizer.json"),
+        'word_tokenizer': "TB_word_tokenizer.json",
+        'morph_tag_tokenizer': "Stemmer_morph_tag_tokenizer.json",
+        'pos_label_tokenizer': "PoS_label_tokenizer.json",
+        'dp_label_tokenizer': "DP_label_tokenizer.json",
         'params': {'word_embedding_vector_size': 128, 'pos_embedding_vector_size': 8, 'num_rnn_stacks': 2, 'tag_num_rnn_units': 128, 'lc_num_rnn_units': 384, 'lc_arc_label_num_rnn_units': 384, 'rc_num_rnn_units': 384, 'fc_units_multipliers': (8, 4), 'word_form': 'whole', 'dropout': 0.2, 'sentence_max_len': 40, 'tag_max_len': 15}
     }
 }
@@ -75,20 +76,19 @@ class SPUContextDP:
     Optimized with tf.function for high-performance inference.
     """
     def __init__(self, evaluate: bool = False):
-        """
-        Initializes the model, loads weights, and compiles the prediction function.
-        """
         logger.info(f"Initializing SPUContextDP model (evaluate={evaluate})...")
         config = _MODEL_CONFIGS['SPUContextDP']
         self.params = config['params']
         cache_dir = get_vnlp_cache_dir()
 
-        # --- Download and Load Resources ---
+        # --- MODIFIED: Load local resources using get_resource_path ---
+        spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
+        label_tokenizer_path = get_resource_path("vnlp_colab.dep.resources", config['label_tokenizer'])
+        
+        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
-        spu_tokenizer_path = download_resource(*config['spu_tokenizer'], cache_dir)
-        label_tokenizer_path = download_resource(*config['label_tokenizer'], cache_dir)
 
         self.spu_tokenizer_word = spm.SentencePieceProcessor(model_file=str(spu_tokenizer_path))
         self.tokenizer_label = load_keras_tokenizer(label_tokenizer_path)
@@ -101,7 +101,6 @@ class SPUContextDP:
         self.model = create_spucontext_dp_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             arc_label_vector_len=self.arc_label_vector_len,
-            word_embedding_dim=self.params['word_embedding_dim'],
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
             num_rnn_units=num_rnn_units, **config['params']
         )
@@ -124,14 +123,6 @@ class SPUContextDP:
         self.compiled_predict_step = predict_step
 
     def predict(self, tokens: List[str]) -> List[Tuple[int, str, int, str]]:
-        """
-        High-level API for Sentence Dependency Parsing.
-
-        Args:
-            tokens (list): Input sentence tokens.
-        Returns:
-            List[Tuple[int, str, int, str]]: A list of tuple of token_index, tokens, arc and DEP Parsing results 
-        """
         if not tokens: return []
         arcs, labels = [], []
         for t in range(len(tokens)):
@@ -158,13 +149,21 @@ class TreeStackDP:
         self.params = config['params']
         cache_dir = get_vnlp_cache_dir()
 
+        # --- MODIFIED: Load local resources using get_resource_path ---
+        word_tok_path = get_resource_path("vnlp_colab.resources", config['word_tokenizer'])
+        morph_tok_path = get_resource_path("vnlp_colab.stemmer.resources", config['morph_tag_tokenizer'])
+        pos_tok_path = get_resource_path("vnlp_colab.pos.resources", config['pos_label_tokenizer'])
+        dp_tok_path = get_resource_path("vnlp_colab.dep.resources", config['dp_label_tokenizer'])
+        
+        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
-        self.tokenizer_word = load_keras_tokenizer(download_resource(*config['word_tokenizer'], cache_dir))
-        self.tokenizer_morph_tag = load_keras_tokenizer(download_resource(*config['morph_tag_tokenizer'], cache_dir))
-        self.tokenizer_pos = load_keras_tokenizer(download_resource(*config['pos_label_tokenizer'], cache_dir))
-        self.tokenizer_label = load_keras_tokenizer(download_resource(*config['dp_label_tokenizer'], cache_dir))
+
+        self.tokenizer_word = load_keras_tokenizer(word_tok_path)
+        self.tokenizer_morph_tag = load_keras_tokenizer(morph_tok_path)
+        self.tokenizer_pos = load_keras_tokenizer(pos_tok_path)
+        self.tokenizer_label = load_keras_tokenizer(dp_tok_path)
         
         word_embedding_matrix = np.load(embedding_path)
         tag_embedding_matrix = self.stemmer_analyzer.model.layers[5].weights[0].numpy()
@@ -172,6 +171,7 @@ class TreeStackDP:
         
         self.model = create_treestack_dp_model(
             word_embedding_vocab_size=len(self.tokenizer_word.word_index) + 1,
+            word_embedding_matrix=np.zeros_like(word_embedding_matrix),
             pos_vocab_size=len(self.tokenizer_pos.word_index),
             arc_label_vector_len=self.arc_label_vector_len,
             tag_embedding_matrix=tag_embedding_matrix,
@@ -205,10 +205,7 @@ class TreeStackDP:
                 for i, token in enumerate(tokens)]
 
 class DependencyParser:
-    """
-    Main API class for Dependency Parser implementations.
-    Uses a singleton factory for efficient model instance management.
-    """
+    """Main API class for Dependency Parser implementations."""
     def __init__(self, model: str = 'SPUContextDP', evaluate: bool = False):
         self.available_models = ['SPUContextDP', 'TreeStackDP']
         if model not in self.available_models:
@@ -221,7 +218,6 @@ class DependencyParser:
                 instance = SPUContextDP(evaluate)
             elif model == 'TreeStackDP':
                 stemmer = get_stemmer_analyzer(evaluate)
-                # TreeStackDP requires a TreeStackPoS instance
                 pos_tagger = PoSTagger(model='TreeStackPoS', evaluate=evaluate) 
                 instance = TreeStackDP(stemmer, pos_tagger, evaluate)
             _MODEL_INSTANCE_CACHE[cache_key] = instance
@@ -232,13 +228,19 @@ class DependencyParser:
     def predict(
         self, tokens: List[str], displacy_format: bool = False,
         pos_result: List[Tuple[str, str]] = None
-    ) -> List[Tuple[int, str, int, str]]:
-        """High-level API for Dependency Parsing on pre-tokenized text."""
-        # The displacy format requires the original sentence string, which we no longer pass.
-        # We will reconstruct it for this specific feature.
-        sentence_for_displacy = " ".join(tokens) if displacy_format else ""
+    ) -> Union[List[Tuple[int, str, int, str]], List[Dict]]:
+        """
+        High-level API for Dependency Parsing on pre-tokenized text.
         
-        # The underlying predict methods now only need tokens.
+        Args:
+            tokens (List[str]): Input sentence tokens.
+            displacy_format (bool): If True, returns output in spaCy's displaCy format.
+            pos_result (List[Tuple[str, str]]): Corresponding PoS tags, required for
+                displaCy format to show tags correctly.
+        
+        Returns:
+            The dependency parse result, either as a list of tuples or a displaCy dictionary.
+        """
         dp_result = self.instance.predict(tokens)
         
         if displacy_format:

@@ -1,3 +1,4 @@
+# vnlp_colab/ner/ner_colab.py
 # coding=utf-8
 #
 # Copyright 2025 VNLP Project Authors.
@@ -30,7 +31,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 # Updated imports for package structure
-from vnlp_colab.utils_colab import download_resource, load_keras_tokenizer, get_vnlp_cache_dir
+from vnlp_colab.utils_colab import download_resource, load_keras_tokenizer, get_vnlp_cache_dir, get_resource_path
 from vnlp_colab.ner.ner_utils_colab import (
     create_spucontext_ner_model, process_ner_input,
     create_charner_model, ner_to_displacy_format
@@ -46,30 +47,21 @@ _MODEL_CONFIGS = {
         'weights_prod': ("NER_SPUContext_prod.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/NER_SPUContext_prod.weights"),
         'weights_eval': ("NER_SPUContext_eval.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/NER_SPUContext_eval.weights"),
         'word_embedding_matrix': ("SPUTokenized_word_embedding_16k.matrix", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/SPUTokenized_word_embedding_16k.matrix"),
-        'spu_tokenizer': ("SPU_word_tokenizer_16k.model", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/resources/SPU_word_tokenizer_16k.model"),
-        'label_tokenizer': ("NER_label_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/named_entity_recognizer/resources/NER_label_tokenizer.json"),
+        'spu_tokenizer': "SPU_word_tokenizer_16k.model",
+        'label_tokenizer': "NER_label_tokenizer.json",
         'params': {
-            'word_embedding_dim': 128,
-            'num_rnn_stacks': 2,
-            'rnn_units_multiplier': 2,
-            'fc_units_multiplier': (2, 1),
-            'dropout': 0.2,
+            'word_embedding_dim': 128, 'num_rnn_stacks': 2, 'rnn_units_multiplier': 2,
+            'fc_units_multiplier': (2, 1), 'dropout': 0.2,
         }
     },
     'CharNER': {
         'weights_prod': ("NER_CharNER_prod.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/NER_CharNER_prod.weights"),
         'weights_eval': ("NER_CharNER_eval.weights", "https://vnlp-model-weights.s3.eu-west-1.amazonaws.com/NER_CharNER_eval.weights"),
-        'char_tokenizer': ("CharNER_char_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/named_entity_recognizer/resources/CharNER_char_tokenizer.json"),
-        'label_tokenizer': ("NER_label_tokenizer.json", "https://raw.githubusercontent.com/vngrs-ai/vnlp/main/vnlp/named_entity_recognizer/resources/NER_label_tokenizer.json"),
+        'char_tokenizer': "CharNER_char_tokenizer.json",
+        'label_tokenizer': "NER_label_tokenizer.json",
         'params': {
-            'char_vocab_size': 150,
-            'seq_len_max': 256,
-            'embed_size': 32,
-            'rnn_dim': 128,
-            'num_rnn_stacks': 5,
-            'mlp_dim': 32,
-            'num_classes': 5,
-            'dropout': 0.3,
+            'char_vocab_size': 150, 'seq_len_max': 256, 'embed_size': 32, 'rnn_dim': 128,
+            'num_rnn_stacks': 5, 'mlp_dim': 32, 'num_classes': 5, 'dropout': 0.3,
             'padding_strat': 'post',
         }
     }
@@ -89,12 +81,14 @@ class SPUContextNER:
         config = _MODEL_CONFIGS['SPUContextNER']
         cache_dir = get_vnlp_cache_dir()
 
-        # Download and load resources
+        # --- MODIFIED: Load local resources using get_resource_path ---
+        spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
+        label_tokenizer_path = get_resource_path("vnlp_colab.ner.resources", config['label_tokenizer'])
+        
+        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
-        spu_tokenizer_path = download_resource(*config['spu_tokenizer'], cache_dir)
-        label_tokenizer_path = download_resource(*config['label_tokenizer'], cache_dir)
 
         self.spu_tokenizer_word = spm.SentencePieceProcessor(model_file=str(spu_tokenizer_path))
         self.tokenizer_label = load_keras_tokenizer(label_tokenizer_path)
@@ -107,20 +101,14 @@ class SPUContextNER:
         self.model = create_spucontext_ner_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             entity_vocab_size=len(self.tokenizer_label.word_index),
-            word_embedding_dim=params['word_embedding_dim'],
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
-            num_rnn_units=num_rnn_units,
-            num_rnn_stacks=params['num_rnn_stacks'],
-            fc_units_multiplier=params['fc_units_multiplier'],
-            dropout=params['dropout']
+            num_rnn_units=num_rnn_units, **params
         )
 
         with open(weights_path, 'rb') as fp:
             model_weights = pickle.load(fp)
         
-        full_weights = [word_embedding_matrix] + model_weights
-        self.model.set_weights(full_weights)
-
+        self.model.set_weights([word_embedding_matrix] + model_weights)
         self._initialize_compiled_predict_step()
         logger.info("SPUContextNER model initialized successfully.")
 
@@ -141,25 +129,12 @@ class SPUContextNER:
         self.compiled_predict_step = predict_step
 
     def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> List[Tuple[str, str]]:
-        """
-        High-level API for Named Entity Recognition.
-
-        Args:
-            sentence (string): Input Sentence (Not used for parsing, but for displacy_format)
-            tokens (list): Input sentence tokens.
-        Returns:
-            List[Tuple[str, str]]: A list of tuple of tokens and NER results 
-        """
-        if not tokens:
-            return []
-
+        if not tokens: return []
         num_tokens = len(tokens)
         int_preds: List[int] = []
 
         for t in range(num_tokens):
-            inputs_np = process_ner_input(
-                t, tokens, self.spu_tokenizer_word, self.tokenizer_label, int_preds
-            )
+            inputs_np = process_ner_input(t, tokens, self.spu_tokenizer_word, self.tokenizer_label, int_preds)
             inputs_tf = [tf.convert_to_tensor(arr) for arr in inputs_np]
             logits = self.compiled_predict_step(*inputs_tf).numpy()[0]
             int_pred = np.argmax(logits, axis=-1)
@@ -170,8 +145,6 @@ class SPUContextNER:
 
         return ner_to_displacy_format(sentence, ner_result) if displacy_format else ner_result
 
-# The CharNER class remains largely unchanged as its architecture is simpler.
-# We will ensure its resources are downloaded and managed correctly.
 class CharNER:
     """Character-Level Named Entity Recognizer."""
     def __init__(self, evaluate: bool = False):
@@ -179,11 +152,15 @@ class CharNER:
         config = _MODEL_CONFIGS['CharNER']
         cache_dir = get_vnlp_cache_dir()
 
+        # --- MODIFIED: Load local resources using get_resource_path ---
+        resource_pkg_path = "vnlp_colab.ner.resources"
+        char_tokenizer_path = get_resource_path(resource_pkg_path, config['char_tokenizer'])
+        label_tokenizer_path = get_resource_path(resource_pkg_path, config['label_tokenizer'])
+        
+        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
-        char_tokenizer_path = download_resource(*config['char_tokenizer'], cache_dir)
-        label_tokenizer_path = download_resource(*config['label_tokenizer'], cache_dir)
-
+        
         self.tokenizer_char = load_keras_tokenizer(char_tokenizer_path)
         self.tokenizer_label = load_keras_tokenizer(label_tokenizer_path)
         
@@ -208,7 +185,6 @@ class CharNER:
         padded = keras.preprocessing.sequence.pad_sequences(
             sequences, maxlen=self.seq_len_max, padding=self.padding_strat
         )
-        # Use compiled function for single prediction
         raw_pred = self.model(padded, training=False)
         return np.argmax(raw_pred, axis=2).flatten()
 
@@ -218,7 +194,7 @@ class CharNER:
         decoded_entities = []
         for i in range(len(cumsum_of_lens) - 1):
             island = preds[cumsum_of_lens[i] : cumsum_of_lens[i+1] - 1]
-            mode_value = 0 # Default for empty tokens
+            mode_value = 0
             if island.size > 0:
                 vals, counts = np.unique(island, return_counts=True)
                 mode_value = vals[np.argmax(counts)]
@@ -227,12 +203,8 @@ class CharNER:
         return decoded_entities
 
     def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> List[Tuple[str, str]]:
-        # CharNER's logic is based on WordPunctTokenize and character lengths, so it re-tokenizes internally.
-        # This is an exception to the "tokenize once" rule due to the model's specific design.
         internal_tokens = WordPunctTokenize(sentence)
-        
         if len(" ".join(internal_tokens)) > self.seq_len_max:
-            # Recursive splitting for long sentences            
             mid = len(internal_tokens) // 2
             first_half_sent = " ".join(internal_tokens[:mid])
             second_half_sent = " ".join(internal_tokens[mid:])
@@ -246,10 +218,7 @@ class CharNER:
 
 
 class NamedEntityRecognizer:
-    """
-    Main API class for Named Entity Recognizer implementations.
-    Uses a singleton factory for efficient model instance management.
-    """
+    """Main API class for Named Entity Recognizer implementations."""
     def __init__(self, model: str = 'SPUContextNER', evaluate: bool = False):
         self.available_models = ['SPUContextNER', 'CharNER']
         if model not in self.available_models:
@@ -267,27 +236,22 @@ class NamedEntityRecognizer:
             logger.info(f"Found cached instance for '{cache_key}'.")
         self.instance: Union[SPUContextNER, CharNER] = _MODEL_INSTANCE_CACHE[cache_key]
 
-    def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> List[Tuple[str, str]]:
-        """High-level API for Named Entity Recognition."""
+    def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> Union[List[Tuple[str, str]], Dict]:
         return self.instance.predict(sentence, tokens, displacy_format)
 
 
-
-# --- Main Entry Point for Standalone Use ---
-
 def main():
     """Demonstrates and tests the NER module functions."""
-    from utils_colab import setup_logging
+    from vnlp_colab.utils_colab import setup_logging
     setup_logging()
-
     logger.info("--- VNLP Colab NER Test Suite ---")
-
-    # Test SPUContextNER
+    
     try:
         logger.info("\n1. Testing SPUContextNER...")
         ner_spu = NamedEntityRecognizer(model='SPUContextNER')
         sentence1 = "Benim adım Melikşah, İstanbul'da yaşıyorum."
-        result1 = ner_spu.predict(sentence1)
+        tokens1 = WordPunctTokenize(sentence1)
+        result1 = ner_spu.predict(sentence1, tokens1)
         logger.info(f"   Input: '{sentence1}'")
         logger.info(f"   Output: {result1}")
         assert len(result1) > 0 and result1[2][1] == 'PER'
@@ -295,12 +259,11 @@ def main():
     except Exception as e:
         logger.error(f"   SPUContextNER test FAILED: {e}", exc_info=True)
 
-    # Test CharNER
     try:
         logger.info("\n2. Testing CharNER...")
         ner_char = NamedEntityRecognizer(model='CharNER')
         sentence2 = "VNGRS AI Takımı'nda çalışıyorum."
-        result2 = ner_char.predict(sentence2)
+        result2 = ner_char.predict(sentence2, []) # Tokens ignored by CharNER
         logger.info(f"   Input: '{sentence2}'")
         logger.info(f"   Output: {result2}")
         assert len(result2) > 0 and result2[0][1] == 'ORG'
@@ -308,11 +271,10 @@ def main():
     except Exception as e:
         logger.error(f"   CharNER test FAILED: {e}", exc_info=True)
         
-    # Test Singleton Caching
     logger.info("\n3. Testing Singleton Caching...")
     import time
     start_time = time.time()
-    ner_spu_cached = NamedEntityRecognizer(model='SPUContextNER')
+    _ = NamedEntityRecognizer(model='SPUContextNER')
     end_time = time.time()
     logger.info(f"   Re-initialization took: {end_time - start_time:.4f} seconds.")
     assert (end_time - start_time) < 0.1, "Caching failed, re-initialization was too slow."

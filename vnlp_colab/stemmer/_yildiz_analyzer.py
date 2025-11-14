@@ -1,15 +1,19 @@
-# File: /home/ben/miniconda3/envs/bookanalysis/lib/python3.12/site-packages/vnlp/stemmer_morph_analyzer/_yildiz_analyzer.py
+# vnlp_colab/stemmer/_yildiz_analyzer.py
 # ---
-# This file has been audited and corrected. The original, behaviorally-correct
-# utility functions have been restored to fix an accuracy regression.
+# This file has been refactored to use importlib.resources for robust
+# access to package data, resolving the FileNotFoundError.
 
 # -*- coding: utf-8 -*-
 import re
-import os
 import logging
 from collections import namedtuple
 
-resources_path = os.path.join(os.path.dirname(__file__), "resources/")
+# --- MODIFIED: Use the robust resource locator from utils_colab ---
+from vnlp_colab.utils_colab import get_resource_path
+
+# --- REMOVED: The os-based path is no longer needed ---
+# import os
+# resources_path = os.path.join(os.path.dirname(__file__), "resources/")
 
 _GENERATOR_INSTANCE_CACHE = {}
 
@@ -29,9 +33,13 @@ class TurkishStemSuffixCandidateGenerator(object):
     """
     ROOT_TRANSFORMATION_MAP = {"tıp": "tıb", "prof.": "profesör", "dr.": "doktor", "yi": "ye", "ed": "et", "di": "de"}
     TAG_FLAG_MAP = {0: "Adj", 1: "Adverb", 2: "Conj", 3: "Det", 4: "Dup", 5: "Interj", 6: "Noun", 7: "Postp", 8: "Pron", 9: "Ques", 10: "Verb", 11: "Num", 12: "Noun+Prop"}
-    SUFFIX_DICT_FILE_PATH = os.path.join(resources_path, "Suffixes&Tags.txt")
-    STEM_LIST_FILE_PATH = os.path.join(resources_path, "StemListWithFlags_v2.txt")
-    EXACT_LOOKUP_TABLE_FILE_PATH = os.path.join(resources_path, "ExactLookup.txt")
+    
+    # --- MODIFIED: Use get_resource_path to find files within the package ---
+    _RESOURCE_PKG_PATH = "vnlp_colab.stemmer.resources"
+    SUFFIX_DICT_FILE_PATH = get_resource_path(_RESOURCE_PKG_PATH, "Suffixes&Tags.txt")
+    STEM_LIST_FILE_PATH = get_resource_path(_RESOURCE_PKG_PATH, "StemListWithFlags_v2.txt")
+    EXACT_LOOKUP_TABLE_FILE_PATH = get_resource_path(_RESOURCE_PKG_PATH, "ExactLookup.txt")
+    
     CONSONANT_STR = "[bcdfgğhjklmnprsştvyzxwqBCDFGĞHJKLMNPRSŞTVYZXWQ]"
     VOWEL_STR = "[aeıioöuüAEIİOÖUÜ]"
     NARROW_VOWELS_STR = "[uüıiUÜIİ]"
@@ -103,8 +111,9 @@ class TurkishStemSuffixCandidateGenerator(object):
     def _transform_soft_consonants(text):
         replacements = [
             (r"^(.*)b$", r"\1p"), (r"^(.*)B$", r"\1P"), (r"^(.*)c$", r"\1ç"),
-            (r"^(.*)C$", r"\1Ç"), (r"^(.*)d$", r"\1t"), (r"^(.*)D$", r"\1T"),
-            (r"^(.*)ğ$", r"\1k"), (r"^(.*)Ğ$", r"\1K"), (r"^(.*)g$", r"\1k"),
+            (r"^(.*)C$", r"\1Ç"), (r"^(.*)d$", r"\1t"),
+            (r"^(.*)D$", r"\1T"), (r"^(.*)ğ$", r"\1k"),
+            (r"^(.*)Ğ$", r"\1K"), (r"^(.*)g$", r"\1k"),
             (r"^(.*)G$", r"\1K")
         ]
         for pattern, repl in replacements:
