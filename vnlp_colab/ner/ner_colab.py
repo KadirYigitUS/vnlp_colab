@@ -81,11 +81,9 @@ class SPUContextNER:
         config = _MODEL_CONFIGS['SPUContextNER']
         cache_dir = get_vnlp_cache_dir()
 
-        # --- MODIFIED: Load local resources using get_resource_path ---
         spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
         label_tokenizer_path = get_resource_path("vnlp_colab.ner.resources", config['label_tokenizer'])
         
-        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
@@ -95,14 +93,15 @@ class SPUContextNER:
         self._label_index_word = {i: w for w, i in self.tokenizer_label.word_index.items()}
         
         word_embedding_matrix = np.load(embedding_path)
-        params = config['params']
-        num_rnn_units = params['word_embedding_dim'] * params['rnn_units_multiplier']
+        params = config['params'].copy() # Use a copy to modify safely
+        num_rnn_units = params['word_embedding_dim'] * params.pop('rnn_units_multiplier') # Pop the key
         
         self.model = create_spucontext_ner_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             entity_vocab_size=len(self.tokenizer_label.word_index),
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
-            num_rnn_units=num_rnn_units, **params
+            num_rnn_units=num_rnn_units, 
+            **params # Now this is safe
         )
 
         with open(weights_path, 'rb') as fp:
@@ -113,7 +112,6 @@ class SPUContextNER:
         logger.info("SPUContextNER model initialized successfully.")
 
     def _initialize_compiled_predict_step(self):
-        """Creates a compiled TensorFlow function for the model's forward pass."""
         entity_vocab_size = len(self.tokenizer_label.word_index)
         input_signature = [
             tf.TensorSpec(shape=(1, 8), dtype=tf.int32),
@@ -128,7 +126,7 @@ class SPUContextNER:
             
         self.compiled_predict_step = predict_step
 
-    def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> List[Tuple[str, str]]:
+    def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> Union[List[Tuple[str, str]], Dict]:
         if not tokens: return []
         num_tokens = len(tokens)
         int_preds: List[int] = []
@@ -152,12 +150,10 @@ class CharNER:
         config = _MODEL_CONFIGS['CharNER']
         cache_dir = get_vnlp_cache_dir()
 
-        # --- MODIFIED: Load local resources using get_resource_path ---
         resource_pkg_path = "vnlp_colab.ner.resources"
         char_tokenizer_path = get_resource_path(resource_pkg_path, config['char_tokenizer'])
         label_tokenizer_path = get_resource_path(resource_pkg_path, config['label_tokenizer'])
         
-        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         
@@ -202,13 +198,22 @@ class CharNER:
             decoded_entities.append(detokenized or 'O')
         return decoded_entities
 
-    def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> List[Tuple[str, str]]:
+    def predict(self, sentence: str, tokens: List[str], displacy_format: bool = False) -> Union[List[Tuple[str, str]], Dict]:
         internal_tokens = WordPunctTokenize(sentence)
         if len(" ".join(internal_tokens)) > self.seq_len_max:
             mid = len(internal_tokens) // 2
             first_half_sent = " ".join(internal_tokens[:mid])
             second_half_sent = " ".join(internal_tokens[mid:])
-            return self.predict(first_half_sent, []) + self.predict(second_half_sent, [])
+            first_half_res = self.predict(first_half_sent, [], displacy_format)
+            second_half_res = self.predict(second_half_sent, [], displacy_format)
+            if displacy_format:
+                # This simplistic merge might have issues with sentence boundaries
+                second_half_res['text'] = first_half_res['text'] + " " + second_half_res['text']
+                second_half_res['ents'].extend(first_half_res['ents'])
+                return second_half_res
+            else:
+                return first_half_res + second_half_res
+
 
         char_preds = self._predict_char_level(internal_tokens)
         decoded_entities = self._charner_decoder(internal_tokens, char_preds)

@@ -81,11 +81,9 @@ class SPUContextDP:
         self.params = config['params']
         cache_dir = get_vnlp_cache_dir()
 
-        # --- MODIFIED: Load local resources using get_resource_path ---
         spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
         label_tokenizer_path = get_resource_path("vnlp_colab.dep.resources", config['label_tokenizer'])
         
-        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
@@ -97,12 +95,15 @@ class SPUContextDP:
         word_embedding_matrix = np.load(embedding_path)
 
         # --- Build and Load Model ---
-        num_rnn_units = self.params['word_embedding_dim'] * self.params['rnn_units_multiplier']
+        params = self.params.copy() # Use a copy to modify safely
+        num_rnn_units = params['word_embedding_dim'] * params.pop('rnn_units_multiplier') # Pop the key
+        
         self.model = create_spucontext_dp_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             arc_label_vector_len=self.arc_label_vector_len,
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
-            num_rnn_units=num_rnn_units, **config['params']
+            num_rnn_units=num_rnn_units, 
+            **params # Now this is safe
         )
         with open(weights_path, 'rb') as fp: model_weights = pickle.load(fp)
         self.model.set_weights([word_embedding_matrix] + model_weights)
@@ -111,8 +112,8 @@ class SPUContextDP:
 
     def _initialize_compiled_predict_step(self):
         input_signature = [
-            tf.TensorSpec(shape=(1, 8), dtype=tf.int32), # TOKEN_PIECE_MAX_LEN
-            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32), # SENTENCE_MAX_LEN
+            tf.TensorSpec(shape=(1, 8), dtype=tf.int32),
+            tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
             tf.TensorSpec(shape=(1, 40, 8), dtype=tf.int32),
             tf.TensorSpec(shape=(1, 40, self.arc_label_vector_len), dtype=tf.float32),
         ]
@@ -149,13 +150,11 @@ class TreeStackDP:
         self.params = config['params']
         cache_dir = get_vnlp_cache_dir()
 
-        # --- MODIFIED: Load local resources using get_resource_path ---
         word_tok_path = get_resource_path("vnlp_colab.resources", config['word_tokenizer'])
         morph_tok_path = get_resource_path("vnlp_colab.stemmer.resources", config['morph_tag_tokenizer'])
         pos_tok_path = get_resource_path("vnlp_colab.pos.resources", config['pos_label_tokenizer'])
         dp_tok_path = get_resource_path("vnlp_colab.dep.resources", config['dp_label_tokenizer'])
         
-        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
@@ -229,18 +228,6 @@ class DependencyParser:
         self, tokens: List[str], displacy_format: bool = False,
         pos_result: List[Tuple[str, str]] = None
     ) -> Union[List[Tuple[int, str, int, str]], List[Dict]]:
-        """
-        High-level API for Dependency Parsing on pre-tokenized text.
-        
-        Args:
-            tokens (List[str]): Input sentence tokens.
-            displacy_format (bool): If True, returns output in spaCy's displaCy format.
-            pos_result (List[Tuple[str, str]]): Corresponding PoS tags, required for
-                displaCy format to show tags correctly.
-        
-        Returns:
-            The dependency parse result, either as a list of tuples or a displaCy dictionary.
-        """
         dp_result = self.instance.predict(tokens)
         
         if displacy_format:

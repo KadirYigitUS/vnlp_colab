@@ -75,11 +75,9 @@ class SPUContextPoS:
         config = _MODEL_CONFIGS['SPUContextPoS']
         cache_dir = get_vnlp_cache_dir()
 
-        # --- MODIFIED: Load local resources using get_resource_path ---
         spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
         label_tokenizer_path = get_resource_path("vnlp_colab.pos.resources", config['label_tokenizer'])
         
-        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_matrix_path = download_resource(*config['word_embedding_matrix'], cache_dir)
@@ -90,14 +88,15 @@ class SPUContextPoS:
         word_embedding_matrix = np.load(embedding_matrix_path)
 
         # --- Build and Load Model ---
-        params = config['params']
-        num_rnn_units = params['word_embedding_dim'] * params['rnn_units_multiplier']
+        params = config['params'].copy() # Use a copy to modify safely
+        num_rnn_units = params['word_embedding_dim'] * params.pop('rnn_units_multiplier') # Pop the key
         
         self.model = create_spucontext_pos_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             pos_vocab_size=len(self.tokenizer_label.word_index),
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
-            num_rnn_units=num_rnn_units, **params
+            num_rnn_units=num_rnn_units,
+            **params # Now this is safe to unpack
         )
 
         with open(weights_path, 'rb') as fp:
@@ -108,7 +107,6 @@ class SPUContextPoS:
         logger.info("SPUContextPoS model initialized successfully.")
 
     def _initialize_compiled_predict_step(self):
-        """Creates a compiled TensorFlow function for the model's forward pass."""
         pos_vocab_size = len(self.tokenizer_label.word_index)
         input_signature = [
             tf.TensorSpec(shape=(1, 8), dtype=tf.int32),
@@ -123,8 +121,7 @@ class SPUContextPoS:
         self.compiled_predict_step = predict_step
 
     def predict(self, tokens: List[str]) -> List[Tuple[str, str]]:
-        if not tokens:
-            return []
+        if not tokens: return []
         int_preds: List[int] = []
         for t in range(len(tokens)):
             inputs_np = process_pos_input(t, tokens, self.spu_tokenizer_word, self.tokenizer_label, int_preds)
@@ -144,12 +141,10 @@ class TreeStackPoS:
         self.params = config['params']
         cache_dir = get_vnlp_cache_dir()
 
-        # --- MODIFIED: Load local resources using get_resource_path ---
         word_tok_path = get_resource_path("vnlp_colab.resources", config['word_tokenizer'])
         morph_tok_path = get_resource_path("vnlp_colab.stemmer.resources", config['morph_tag_tokenizer'])
         pos_tok_path = get_resource_path("vnlp_colab.pos.resources", config['pos_label_tokenizer'])
 
-        # Download heavyweight remote resources
         weights_file, weights_url = config['weights_eval'] if evaluate else config['weights_prod']
         weights_path = download_resource(weights_file, weights_url, cache_dir)
         embedding_path = download_resource(*config['word_embedding_matrix'], cache_dir)
@@ -214,9 +209,9 @@ class PoSTagger:
         return self.instance.predict(tokens)
 
 
-# --- Main Entry Point for Standalone Use ---
 def main():
     """Demonstrates and tests the PoS Tagger module."""
+    from vnlp_colab.utils_colab import setup_logging
     setup_logging()
     logger.info("--- VNLP Colab PoS Tagger Test Suite ---")
     sentence = "Vapurla Beşiktaş'a geçip yürüyerek Maçka Parkı'na ulaştım."
