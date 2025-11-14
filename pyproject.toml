@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vnlp_colab"
-version = "2.0.1" # Incremented patch version for the fix
+version = "2.0.2" # Incremented patch version for packaging fix
 authors = [
   { name="VNLP Project Authors" },
 ]
@@ -28,7 +28,7 @@ dependencies = [
     "pandas>=2.0.0",
     "sentencepiece==0.2.1",
     "tqdm>=4.62.0",
-    "regex>=2023.6.3",
+    "regex>=2.3.6.3",
     "requests>=2.28.0",
 ]
 
@@ -36,12 +36,15 @@ dependencies = [
 "Homepage" = "https://github.com/vngrs-ai/vnlp"
 "Bug Tracker" = "https://github.com/vngrs-ai/vnlp/issues"
 
-[tool.setuptools]
-packages = ["vnlp_colab", "vnlp_colab.dep", "vnlp_colab.ner", "vnlp_colab.normalizer", "vnlp_colab.pos", "vnlp_colab.sentiment", "vnlp_colab.stemmer"]
+# --- MODIFIED SECTION ---
+# This replaces the manual 'packages' list with automatic discovery.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vnlp_colab*"]
 
 [tool.setuptools.package-data]
 "vnlp_colab.dep.resources" = ["*.json"]
 "vnlp_colab.ner.resources" = ["*.json"]
 "vnlp_colab.pos.resources" = ["*.json"]
 "vnlp_colab.stemmer.resources" = ["*.txt", "*.json"]
-"vnlp_colab.resources" = ["*.txt", "*.model"] 
+"vnlp_colab.resources" = ["*.txt", "*.model"]
