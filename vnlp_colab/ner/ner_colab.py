@@ -93,15 +93,17 @@ class SPUContextNER:
         self._label_index_word = {i: w for w, i in self.tokenizer_label.word_index.items()}
         
         word_embedding_matrix = np.load(embedding_path)
-        params = config['params'].copy() # Use a copy to modify safely
-        num_rnn_units = params['word_embedding_dim'] * params.pop('rnn_units_multiplier') # Pop the key
+        
+        # --- MODIFIED: Create a clean copy of params for model creation ---
+        model_params = config['params'].copy()
+        num_rnn_units = model_params.pop('word_embedding_dim') * model_params.pop('rnn_units_multiplier')
         
         self.model = create_spucontext_ner_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             entity_vocab_size=len(self.tokenizer_label.word_index),
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
             num_rnn_units=num_rnn_units, 
-            **params # Now this is safe
+            **model_params # Now this is safe
         )
 
         with open(weights_path, 'rb') as fp:
@@ -207,7 +209,6 @@ class CharNER:
             first_half_res = self.predict(first_half_sent, [], displacy_format)
             second_half_res = self.predict(second_half_sent, [], displacy_format)
             if displacy_format:
-                # This simplistic merge might have issues with sentence boundaries
                 second_half_res['text'] = first_half_res['text'] + " " + second_half_res['text']
                 second_half_res['ents'].extend(first_half_res['ents'])
                 return second_half_res

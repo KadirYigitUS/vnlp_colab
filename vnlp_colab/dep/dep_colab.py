@@ -78,7 +78,7 @@ class SPUContextDP:
     def __init__(self, evaluate: bool = False):
         logger.info(f"Initializing SPUContextDP model (evaluate={evaluate})...")
         config = _MODEL_CONFIGS['SPUContextDP']
-        self.params = config['params']
+        self.params_config = config['params'] # Keep the original config for other uses
         cache_dir = get_vnlp_cache_dir()
 
         spu_tokenizer_path = get_resource_path("vnlp_colab.resources", config['spu_tokenizer'])
@@ -91,19 +91,21 @@ class SPUContextDP:
         self.spu_tokenizer_word = spm.SentencePieceProcessor(model_file=str(spu_tokenizer_path))
         self.tokenizer_label = load_keras_tokenizer(label_tokenizer_path)
         self.label_vocab_size = len(self.tokenizer_label.word_index)
-        self.arc_label_vector_len = self.params['sentence_max_len'] + 1 + self.label_vocab_size + 1
+        self.arc_label_vector_len = self.params_config['sentence_max_len'] + 1 + self.label_vocab_size + 1
         word_embedding_matrix = np.load(embedding_path)
 
-        # --- Build and Load Model ---
-        params = self.params.copy() # Use a copy to modify safely
-        num_rnn_units = params['word_embedding_dim'] * params.pop('rnn_units_multiplier') # Pop the key
+        # --- MODIFIED: Create a clean copy for model creation ---
+        model_params = self.params_config.copy()
+        num_rnn_units = model_params.pop('word_embedding_dim') * model_params.pop('rnn_units_multiplier')
+        # Pop any other keys not in the create_model function signature
+        model_params.pop('sentence_max_len')
         
         self.model = create_spucontext_dp_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             arc_label_vector_len=self.arc_label_vector_len,
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
             num_rnn_units=num_rnn_units, 
-            **params # Now this is safe
+            **model_params # Now this is safe
         )
         with open(weights_path, 'rb') as fp: model_weights = pickle.load(fp)
         self.model.set_weights([word_embedding_matrix] + model_weights)
@@ -133,7 +135,7 @@ class SPUContextDP:
             )
             inputs_tf = [tf.convert_to_tensor(arr) for arr in inputs_np]
             logits = self.compiled_predict_step(*inputs_tf).numpy()[0]
-            arc, label = decode_arc_label_vector(logits, self.params['sentence_max_len'], self.label_vocab_size)
+            arc, label = decode_arc_label_vector(logits, self.params_config['sentence_max_len'], self.label_vocab_size)
             arcs.append(arc)
             labels.append(label)
         

@@ -87,16 +87,16 @@ class SPUContextPoS:
         self._label_index_word = {i: w for w, i in self.tokenizer_label.word_index.items()}
         word_embedding_matrix = np.load(embedding_matrix_path)
 
-        # --- Build and Load Model ---
-        params = config['params'].copy() # Use a copy to modify safely
-        num_rnn_units = params['word_embedding_dim'] * params.pop('rnn_units_multiplier') # Pop the key
+        # --- MODIFIED: Create a clean copy of params for model creation ---
+        model_params = config['params'].copy()
+        num_rnn_units = model_params.pop('word_embedding_dim') * model_params.pop('rnn_units_multiplier')
         
         self.model = create_spucontext_pos_model(
             vocab_size=self.spu_tokenizer_word.get_piece_size(),
             pos_vocab_size=len(self.tokenizer_label.word_index),
             word_embedding_matrix=np.zeros_like(word_embedding_matrix),
             num_rnn_units=num_rnn_units,
-            **params # Now this is safe to unpack
+            **model_params # Now this is safe to unpack
         )
 
         with open(weights_path, 'rb') as fp:
