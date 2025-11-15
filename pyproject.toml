@@ -1,18 +1,18 @@
 # pyproject.toml
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools&gt;=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vnlp_colab"
-version = "2.1.0" # Version bump for new features
+version = "2.2.0" # Version bump for ONNX integration
 authors = [
   { name="VNLP Project Authors" },
 ]
 description = "A Colab-optimized version of the VNLP library for high-performance Turkish NLP."
 readme = "README.md"
 license = { text = "AGPL-3.0" }
-requires-python = ">=3.10"
+requires-python = "&gt;=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
@@ -22,14 +22,18 @@ classifiers = [
 
 # All required dependencies for the pipeline to run in a fresh environment.
 dependencies = [
-    "tensorflow>=2.15.0",
-    "keras>=3.0.0",
-    "numpy>=1.26.0",
-    "pandas>=2.0.0",
+    "tensorflow&gt;=2.15.0",
+    "keras&gt;=3.0.0",
+    "numpy&gt;=1.26.0",
+    "pandas&gt;=2.0.0",
     "sentencepiece==0.2.1",
-    "tqdm>=4.62.0",
-    "regex>=2.3.6.3",
-    "requests>=2.28.0",
+    "tqdm&gt;=4.62.0",
+    "regex&gt;=2.3.6.3",
+    "requests&gt;=2.28.0",
+    # --- NEW: Added ONNX dependencies for peak performance ---
+    "onnx&gt;=1.16.0",
+    "tf2onnx&gt;=1.16.0",
+    "onnxruntime-gpu&gt;=1.18.0",
 ]
 
 [project.urls]

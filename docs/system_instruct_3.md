@@ -22,6 +22,8 @@ This project is divided into two distinct, sequential phases. **Complete Phase 1
     *   Chain `.prefetch(tf.data.AUTOTUNE)` to create an asynchronous data pipeline that hides CPU preprocessing latency.
     *   The main loop will now iterate over batches from this dataset, calling the new `.predict_batch()` methods.
 
+**IMPORTANT: PHASE 1 IS COMPLETE**
+
 #### **Phase 2: ONNX Conversion and Integration (Peak Performance)**
 1.  **Model Conversion:**
     *   Develop a utility or script to convert the final, trained Keras models (`.h5` or `.weights`) into the ONNX (`.onnx`) format using the `tf2onnx` library.
