@@ -1,16 +1,21 @@
-### **Test Plan: Executing the Conversion in Google Colab**
+# @title Cell 1: Install Dependencies from GitHub
+import os
 
-#### **Cell 1: Installation & Setup**
+# Set a flag to prevent TF from printing verbose logs during installation
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-# @title Cell 1: Install Dependencies
-# We use -q to make the output less noisy.
-!pip install -q vnlp_colab
-!pip install -q "tf2onnx>=1.16.0" "onnxruntime-gpu>=1.18.0"
+# --- CORRECTED: Install the latest development version directly from GitHub ---
+# The --upgrade flag helps pip resolve dependency conflicts.
+!pip install --upgrade -q "git+https://github.com/KadirYigitUS/vnlp_colab.git"
 
-print("✅ All necessary packages installed successfully.")
+# Install the necessary ONNX packages
+!pip install --upgrade -q "tf2onnx>=1.16.0" "onnxruntime-gpu>=1.18.0"
 
-#### **Cell 2: Run the Conversion Script**
+# Unset the environment variable after installation
+if 'TF_CPP_MIN_LOG_LEVEL' in os.environ:
+    del os.environ['TF_CPP_MIN_LOG_LEVEL']
 
+print("✅ All necessary packages installed successfully from the GitHub repository.")
 # @title Cell 2: Convert All Keras Models to ONNX
 import logging
 import tensorflow as tf
@@ -18,7 +23,7 @@ import tf2onnx
 from pathlib import Path
 from tqdm import tqdm
 
-# --- IMPORTANT: Import directly from the installed vnlp_colab package ---
+# --- This now correctly imports from the GitHub version ---
 from vnlp_colab.stemmer.stemmer_colab import StemmerAnalyzer
 from vnlp_colab.pos.pos_colab import SPUContextPoS
 from vnlp_colab.ner.ner_colab import SPUContextNER, CharNER
@@ -26,7 +31,7 @@ from vnlp_colab.dep.dep_colab import SPUContextDP
 from vnlp_colab.sentiment.sentiment_colab import SPUCBiGRUSentimentAnalyzer
 from vnlp_colab.utils_colab import setup_logging
 
-# --- Define a clear output directory in the Colab environment ---
+# Define a clear output directory in the Colab environment
 OUTPUT_DIR = Path("/content/onnx_models")
 OPSET_VERSION = 13
 
@@ -127,6 +132,7 @@ def run_all_conversions():
 
 # --- Execute the conversion ---
 run_all_conversions()
+
 
 #### **Cell 3: Verification**
 
