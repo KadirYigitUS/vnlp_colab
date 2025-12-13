@@ -1,11 +1,15 @@
 # pyproject.toml
+# coding=utf-8
+# Copyright 2025 VNLP Project Authors.
+# Licensed under AGPL-3.0
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vnlp_colab"
-version = "2.2.0" # Version bump for ONNX integration
+version = "2.2.0"
 authors = [
   { name="VNLP Project Authors" },
 ]
@@ -20,20 +24,21 @@ classifiers = [
     "Topic :: Text Processing :: Linguistic",
 ]
 
-# All required dependencies for the pipeline to run in a fresh environment.
+# Dependencies tuned for Google Colab (Late 2025) compatibility
+# 1. protobuf>=4.25.2 fixes conflicts with ydf/tensorflow-metadata
+# 2. sentencepiece==0.2.1 is mandatory for model weight compatibility
+# 3. tensorflow>=2.15.0 allows Colab's pre-installed TF 2.19+ to remain
 dependencies = [
     "tensorflow>=2.15.0",
     "keras>=3.0.0",
     "numpy>=1.26.0",
     "pandas>=2.0.0",
     "sentencepiece==0.2.1",
+    "protobuf>=4.25.2",
     "tqdm>=4.62.0",
-    "regex>=2.3.6.3",
+    "regex>=2.5.0",
     "requests>=2.28.0",
-    # --- NEW: Added ONNX dependencies for peak performance ---
-    "onnx>=1.16.0",
-    "tf2onnx>=1.16.0",
-    "onnxruntime-gpu>=1.18.0",
+    "spylls>=0.1.5",
 ]
 
 [project.urls]

@@ -1,19 +1,8 @@
 # vnlp_colab/utils_colab.py
 # coding=utf-8
-#
 # Copyright 2025 VNLP Project Authors.
-#
-# Licensed under the GNU Affero General Public License, Version 3.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.gnu.org/licenses/agpl-3.0.html
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Licensed under AGPL-3.0
+
 """
 Core utilities for the VNLP package, refactored for Google Colab.
 
@@ -21,9 +10,9 @@ This module provides essential functions for resource management (downloading,
 caching, local package file access), environment setup, and modern Keras 3 /
 TensorFlow compatibility.
 
-- Version: 2.0.0
+- Version: 2.2.0
 - Keras: 3.x
-- TensorFlow: 2.16+
+- TensorFlow: 2.15+
 - Python: 3.10+
 """
 
@@ -32,11 +21,11 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
-# --- NEW: Added importlib.resources for robust package data access ---
+# Robust package data access
 try:
     import importlib.resources as pkg_resources
 except ImportError:
-    # Fallback for Python < 3.9
+    # Fallback for older Python versions if needed
     import importlib_resources as pkg_resources
 
 import numpy as np
@@ -46,11 +35,14 @@ from tqdm.notebook import tqdm
 
 # --- Environment and Logging Setup ---
 
-__version__ = "2.0.0"
+__version__ = "2.2.0"
 logger = logging.getLogger(__name__)
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """Configures structured logging for the VNLP package."""
+    """
+    Configures structured logging for the VNLP package.
+    Suppresses verbose TensorFlow startup logs.
+    """
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -65,12 +57,7 @@ def setup_logging(level: int = logging.INFO) -> None:
 def get_vnlp_cache_dir() -> Path:
     """
     Returns the Path object for the VNLP cache directory.
-
-    Defaults to /content/vnlp_cache in a Colab-like environment.
-    Creates the directory if it does not exist.
-
-    Returns:
-        Path: The path to the cache directory.
+    Defaults to /content/vnlp_cache in a Colab environment.
     """
     cache_dir = Path("/content/vnlp_cache")
     try:
@@ -83,13 +70,7 @@ def get_vnlp_cache_dir() -> Path:
 def detect_hardware_strategy() -> tf.distribute.Strategy:
     """
     Detects and returns the appropriate TensorFlow distribution strategy.
-
-    - TPUStrategy for TPUs.
-    - MirroredStrategy for multiple GPUs.
-    - OneDeviceStrategy for a single GPU or CPU.
-
-    Returns:
-        tf.distribute.Strategy: The detected distribution strategy.
+    Prioritizes TPU -> Multi-GPU -> Single-GPU -> CPU.
     """
     try:
         tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
@@ -98,11 +79,11 @@ def detect_hardware_strategy() -> tf.distribute.Strategy:
         tf.tpu.experimental.initialize_tpu_system(tpu)
         return tf.distribute.TPUStrategy(tpu)
     except (ValueError, tf.errors.NotFoundError):
-        logger.info("TPU not found. Checking for GPUs.")
+        logger.debug("TPU not found. Checking for GPUs.")
 
     gpus = tf.config.list_physical_devices('GPU')
     if not gpus:
-        logger.info("No GPUs found. Using CPU strategy.")
+        logger.warning("No GPUs found. Using CPU strategy. Inference may be slow.")
         return tf.distribute.OneDeviceStrategy(device="/cpu:0")
 
     if len(gpus) > 1:
@@ -110,40 +91,31 @@ def detect_hardware_strategy() -> tf.distribute.Strategy:
         return tf.distribute.MirroredStrategy()
 
     logger.info("Single GPU found. Using OneDeviceStrategy.")
+    # Attempt to enable memory growth to prevent allocation errors
     for gpu in gpus:
         try:
             tf.config.experimental.set_memory_growth(gpu, True)
         except RuntimeError as e:
             logger.warning(f"Could not set memory growth for GPU {gpu.name}: {e}")
+            
     return tf.distribute.OneDeviceStrategy(device="/gpu:0")
 
 # --- Resource Management ---
 
 def get_resource_path(package_path: str, resource_name: str) -> Path:
     """
-    Gets the path to a resource file within the installed package.
-
-    This is the robust way to access package data, avoiding issues with
-    __file__ and working directories.
-
-    Args:
-        package_path (str): The dot-separated Python path to the package/module
-            containing the resource (e.g., 'vnlp_colab.stemmer.resources').
-        resource_name (str): The name of the file.
-
-    Returns:
-        Path: A Path object pointing to the resource file.
+    Robustly gets the path to a resource file within the installed package.
     
-    Raises:
-        FileNotFoundError: If the resource cannot be found in the package.
+    Args:
+        package_path: Dot-separated python path (e.g., 'vnlp_colab.resources')
+        resource_name: Filename (e.g., 'tokenizer.json')
     """
     try:
         with pkg_resources.path(package_path, resource_name) as path:
             return path
-    except FileNotFoundError:
-        logger.error(f"Resource '{resource_name}' not found in package '{package_path}'.")
+    except (FileNotFoundError, ModuleNotFoundError, ImportError) as e:
+        logger.error(f"Resource '{resource_name}' not found in package '{package_path}'. Error: {e}")
         raise
-
 
 def download_resource(
     file_name: str,
@@ -152,23 +124,8 @@ def download_resource(
     overwrite: bool = False
 ) -> Path:
     """
-    Checks if a file exists and downloads it if not, with a progress bar.
-
-    Args:
-        file_name (str): The name of the file to save.
-        file_url (str): The URL to download the file from.
-        cache_dir (Union[str, Path, None], optional): Directory to cache the file.
-            Defaults to the standard VNLP cache.
-        overwrite (bool, optional): If True, re-downloads the file even if it exists.
-            Defaults to False.
-
-    Returns:
-        Path: The local path to the downloaded file.
-
-    Raises:
-        requests.exceptions.RequestException: If the download fails.
+    Downloads a file with a progress bar if it doesn't exist in the cache.
     """
-
     if cache_dir is None:
         cache_dir = get_vnlp_cache_dir()
     else:
@@ -178,7 +135,7 @@ def download_resource(
     file_path = cache_dir / file_name
 
     if file_path.exists() and not overwrite:
-        logger.info(f"'{file_name}' already exists at '{file_path}'. Skipping download.")
+        logger.info(f"'{file_name}' found in cache. Skipping download.")
         return file_path
 
     logger.info(f"Downloading '{file_name}' from '{file_url}'...")
@@ -200,40 +157,27 @@ def download_resource(
                     f.write(data)
 
             if total_size > 0 and progress_bar.n != total_size:
-                logger.warning(f"Download of '{file_name}' might be incomplete. "
-                               f"Expected {total_size} bytes, got {progress_bar.n} bytes.")
+                logger.warning(f"Download of '{file_name}' might be incomplete.")
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to download '{file_name}': {e}")
         if file_path.exists():
-            file_path.unlink()
+            file_path.unlink()  # Remove partial file
         raise
 
-    logger.info(f"Download of '{file_name}' completed successfully to '{file_path}'.")
+    logger.info(f"Download of '{file_name}' completed successfully.")
     return file_path
 
 def load_keras_tokenizer(tokenizer_json_path: Union[str, Path]) -> tf.keras.preprocessing.text.Tokenizer:
-    """
-    Loads a Keras tokenizer from a JSON file.
-
-    Args:
-        tokenizer_json_path (Union[str, Path]): Path to the tokenizer JSON file.
-
-    Returns:
-        tf.keras.preprocessing.text.Tokenizer: The loaded tokenizer object.
-    """
+    """Loads a Keras tokenizer from a JSON file path."""
     logger.info(f"Loading Keras tokenizer from: {tokenizer_json_path}")
     try:
         with open(tokenizer_json_path, 'r', encoding='utf-8') as f:
             tokenizer_json = f.read()
         return tf.keras.preprocessing.text.tokenizer_from_json(tokenizer_json)
-    except FileNotFoundError:
-        logger.error(f"Tokenizer file not found at: {tokenizer_json_path}")
-        raise
     except Exception as e:
         logger.error(f"Failed to load tokenizer from {tokenizer_json_path}: {e}")
         raise
-
 
 # --- Keras 3 & TensorFlow Model Utilities ---
 
@@ -244,22 +188,14 @@ def create_rnn_stacks(
     go_backwards: bool = False
 ) -> tf.keras.Model:
     """
-    Creates a stack of GRU layers with dropout, compatible with Keras 3.
-
-    Args:
-        num_rnn_stacks (int): The total number of GRU layers in the stack.
-        num_rnn_units (int): The number of units in each GRU layer.
-        dropout (float): The dropout rate to apply between layers.
-        go_backwards (bool, optional): If True, process sequences in reverse.
-            Defaults to False.
-
-    Returns:
-        tf.keras.Model: A Sequential model containing the stack of GRU layers.
+    Creates a stack of GRU layers wrapped in a Sequential model.
+    Compatible with Keras 3 Functional API.
     """
     if num_rnn_stacks < 1:
         raise ValueError("num_rnn_stacks must be at least 1.")
 
     rnn_layers = []
+    # All layers except the last must return sequences
     for _ in range(num_rnn_stacks - 1):
         rnn_layers.append(
             tf.keras.layers.GRU(
@@ -269,33 +205,33 @@ def create_rnn_stacks(
                 go_backwards=go_backwards
             )
         )
+    # The last layer returns the sequence/state as needed by the caller context.
+    # Note: For the DP/NER architectures, intermediate stacks often usually need to return sequences 
+    # to maintain the 40-step context.
+    # However, if this stack serves as a final encoder, it might return a vector.
+    # Based on architecture blueprints, the intermediate RNNs usually return sequences (TimeDistributed context).
+    # We default to returning sequences False for the final layer here to match 'encoder' behavior, 
+    # BUT specific architectures usually override or use this differently.
+    # Correction: The original architecture often has stacks where the last GRU returns a single vector 
+    # OR returns sequences depending on if it's wrapped in TimeDistributed.
+    # For safety in Keras 3, we define the stack.
+    
     rnn_layers.append(
         tf.keras.layers.GRU(
             num_rnn_units,
             dropout=dropout,
-            return_sequences=False,
+            return_sequences=False, # Default to encoder behavior
             go_backwards=go_backwards
         )
     )
     return tf.keras.Sequential(rnn_layers)
-
 
 def tokenize_single_word(
     word: str,
     tokenizer_word: 'spm.SentencePieceProcessor',
     token_piece_max_len: int
 ) -> np.ndarray:
-    """
-    Tokenizes and pads a single word using a SentencePiece tokenizer.
-
-    Args:
-        word (str): The input word.
-        tokenizer_word (spm.SentencePieceProcessor): The SentencePiece tokenizer instance.
-        token_piece_max_len (int): The maximum length for padding/truncating.
-
-    Returns:
-        np.ndarray: A 1D NumPy array of token IDs.
-    """
+    """Tokenizes and pads a single word using SentencePiece."""
     tokenized_ids = tokenizer_word.encode_as_ids(word)
     padded = tf.keras.preprocessing.sequence.pad_sequences(
         [tokenized_ids],
@@ -313,59 +249,52 @@ def process_word_context(
     token_piece_max_len: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Processes the context (left, current, right) for a single word in a sentence.
-
-    Args:
-        word_index (int): Index of the current word in the sentence.
-        sentence_tokens (List[str]): The list of all tokens in the sentence.
-        tokenizer_word: The SentencePiece tokenizer instance.
-        sentence_max_len (int): The max length of the context window on each side.
-        token_piece_max_len (int): The max length of token pieces for a single word.
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray]: A tuple containing the processed
-            current word, left context, and right context as NumPy arrays.
+    Optimized context processor using NumPy pre-allocation.
+    Returns: (current_word, left_context, right_context)
     """
+    # Create NumPy arrays directly
     current_word = sentence_tokens[word_index]
     left_context = sentence_tokens[:word_index]
     right_context = sentence_tokens[word_index + 1:]
 
-    # Process current word
+    # 1. Process Current Word
     current_word_processed = tokenize_single_word(
         current_word, tokenizer_word, token_piece_max_len
     ).astype(np.int32)
 
-    # Process left context
-    left_context_processed = np.array([
-        tokenize_single_word(w, tokenizer_word, token_piece_max_len) for w in left_context
-    ], dtype=np.int32)
+    # 2. Process Left Context
+    # Pre-allocate full buffer with padding (zeros)
+    left_context_processed = np.zeros((sentence_max_len, token_piece_max_len), dtype=np.int32)
     
-    # Pre-pad and truncate left context
-    num_left_pad = sentence_max_len - len(left_context_processed)
-    if num_left_pad > 0:
-        padding = np.zeros((num_left_pad, token_piece_max_len), dtype=np.int32)
-        if len(left_context_processed) > 0:
-            left_context_processed = np.vstack((padding, left_context_processed))
+    if left_context:
+        # Tokenize all left words
+        raw_left = [tokenize_single_word(w, tokenizer_word, token_piece_max_len) for w in left_context]
+        raw_left_np = np.array(raw_left, dtype=np.int32)
+        
+        # Calculate insertion logic
+        num_avail = len(raw_left_np)
+        if num_avail >= sentence_max_len:
+            # Take the last 'sentence_max_len' tokens (closest to current word)
+            left_context_processed = raw_left_np[-sentence_max_len:]
         else:
-            left_context_processed = padding
-    elif num_left_pad < 0:
-        left_context_processed = left_context_processed[-sentence_max_len:]
+            # Fill from the bottom up (end of the array matches word position)
+            left_context_processed[-num_avail:] = raw_left_np
 
-    # Process right context
-    right_context_processed = np.array([
-        tokenize_single_word(w, tokenizer_word, token_piece_max_len) for w in right_context
-    ], dtype=np.int32)
-
-    # Post-pad and truncate right context
-    num_right_pad = sentence_max_len - len(right_context_processed)
-    if num_right_pad > 0:
-        padding = np.zeros((num_right_pad, token_piece_max_len), dtype=np.int32)
-        if len(right_context_processed) > 0:
-            right_context_processed = np.vstack((right_context_processed, padding))
+    # 3. Process Right Context
+    # Pre-allocate full buffer with padding (zeros)
+    right_context_processed = np.zeros((sentence_max_len, token_piece_max_len), dtype=np.int32)
+    
+    if right_context:
+        raw_right = [tokenize_single_word(w, tokenizer_word, token_piece_max_len) for w in right_context]
+        raw_right_np = np.array(raw_right, dtype=np.int32)
+        
+        num_avail = len(raw_right_np)
+        if num_avail >= sentence_max_len:
+            # Take the first 'sentence_max_len' tokens
+            right_context_processed = raw_right_np[:sentence_max_len]
         else:
-            right_context_processed = padding
-    elif num_right_pad < 0:
-        right_context_processed = right_context_processed[:sentence_max_len]
+            # Fill from the top (start of array matches word position)
+            right_context_processed[:num_avail] = raw_right_np
 
     return current_word_processed, left_context_processed, right_context_processed
 

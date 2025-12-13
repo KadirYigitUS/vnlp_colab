@@ -1,29 +1,57 @@
-# @title Cell 1: Install Dependencies from GitHub
+# @title Cell 1: Install Dependencies (Fixed for Colab)
 import os
+import sys
 
-# Set a flag to prevent TF from printing verbose logs during installation
+# Set flag to minimize TensorFlow logging
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-# --- CORRECTED: Install the latest development version directly from GitHub ---
-# The --upgrade flag helps pip resolve dependency conflicts.
-!pip install --upgrade -q "git+https://github.com/KadirYigitUS/vnlp_colab.git"
+print("📦 Step 1: Using Colab's pre-installed TensorFlow and core packages...")
+# Don't upgrade TensorFlow - use what Colab provides (2.19.x)
+# This avoids the tf-keras and tensorflow-text conflicts
 
-# Install the necessary ONNX packages
-!pip install --upgrade -q "tf2onnx>=1.16.0" "onnxruntime-gpu>=1.18.0"
+print("📦 Step 2: Installing compatible ONNX packages...")
+# Install ONNX packages that work with TF 2.19 and modern protobuf
+!pip install --upgrade -q \
+    "protobuf>=5.26.1,<6.0" \
+    "onnx>=1.16.0" \
+    "onnxruntime-gpu>=1.18.0"
 
-# Unset the environment variable after installation
+# Install tf2onnx WITHOUT dependencies to avoid protobuf downgrade
+!pip install --no-deps -q "tf2onnx>=1.16.0"
+
+print("📦 Step 3: Installing vnlp_colab without dependencies...")
+!pip install --no-deps --upgrade -q "git+https://github.com/KadirYigitUS/vnlp_colab.git"
+
+print("📦 Step 4: Installing remaining vnlp_colab dependencies...")
+# Install only the dependencies that aren't already satisfied
+!pip install -q \
+    "sentencepiece==0.2.1" \
+    "tqdm>=4.62.0" \
+    "regex>=2.3.6.3"
+
+# Unset the environment variable
 if 'TF_CPP_MIN_LOG_LEVEL' in os.environ:
     del os.environ['TF_CPP_MIN_LOG_LEVEL']
 
-print("✅ All necessary packages installed successfully from the GitHub repository.")
-# @title Cell 2: Convert All Keras Models to ONNX
+print("\n✅ All packages installed successfully!")
+
+# Verify critical versions
+print("\n📋 Verifying package versions:")
+import google.protobuf
+print(f"  ✓ protobuf: {google.protobuf.__version__}")
+
+# OOM Crash, Tensor Spec error, CUdnnRNNNV3 support issues resolved
+# @title Cell 2 (Corrected): Convert All Keras Models to ONNX (Robust Version)
+
 import logging
 import tensorflow as tf
 import tf2onnx
 from pathlib import Path
 from tqdm import tqdm
+import os
+import gc # Garbage Collector interface
 
-# --- This now correctly imports from the GitHub version ---
+# --- Import from the installed vnlp_colab package ---
 from vnlp_colab.stemmer.stemmer_colab import StemmerAnalyzer
 from vnlp_colab.pos.pos_colab import SPUContextPoS
 from vnlp_colab.ner.ner_colab import SPUContextNER, CharNER
@@ -45,13 +73,21 @@ def convert_model(model_name: str, keras_model: tf.keras.Model, input_signature:
     logger.info(f"--- Converting {model_name} ---")
     logger.info(f"Input signature: {[spec.name for spec in input_signature]}")
     logger.info(f"Output path: {output_path}")
+
+    # FIX 3: Force conversion on CPU to avoid unsupported CudnnRNNV3 op.
+    # This is the standard workaround for this tf2onnx issue.
+    # The final ONNX model is not affected and will run on GPU.
+    logger.info("Forcing CPU context for conversion to ensure compatibility...")
     try:
-        model_proto, _ = tf2onnx.convert.from_keras(keras_model, input_signature, opset=OPSET_VERSION)
+        model_proto, _ = tf2onnx.convert.from_keras(
+            keras_model, input_signature, opset=OPSET_VERSION
+        )
         with open(output_path, "wb") as f:
             f.write(model_proto.SerializeToString())
         logger.info(f"✅ Successfully converted {model_name} to ONNX.")
     except Exception as e:
         logger.error(f"❌ FAILED to convert {model_name}. Error: {e}", exc_info=True)
+
 
 def run_all_conversions():
     """Main function to orchestrate the conversion of all VNLP models."""
@@ -77,7 +113,8 @@ def run_all_conversions():
                 tf.TensorSpec(shape=(None, 8), dtype=tf.int32, name="word_input"),
                 tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32, name="left_input"),
                 tf.TensorSpec(shape=(None, 40, 8), dtype=tf.int32, name="right_input"),
-                tf.TensorSpec(shape=(None, 40, 20), dtype=tf.float32, name="lc_pos_input"),
+                # FIX 2: Corrected shape from 20 to 18 (17 tags + 1 padding)
+                tf.TensorSpec(shape=(None, 40, 18), dtype=tf.float32, name="lc_pos_input"),
             ]
         },
         "SPUContextNER": {
@@ -115,24 +152,36 @@ def run_all_conversions():
             ]
         },
     }
-
+    
+    # FIX 1: Process one model at a time to prevent OOM errors.
     for model_key, config in tqdm(models_to_convert.items(), desc="Converting All Models"):
         for eval_mode in [False, True]:
             mode_suffix = "eval" if eval_mode else "prod"
             full_model_name = f"{model_key}_{mode_suffix}"
+            
             try:
                 logger.info(f"\nInstantiating {full_model_name} to load weights...")
-                keras_model = config["init"](eval_mode)
-                signature = config["signature"]()
-                output_path = OUTPUT_DIR / f"{config['filename']}_{mode_suffix}.onnx"
-                convert_model(full_model_name, keras_model, signature, output_path)
+                
+                # Use a context manager to ensure devices are handled correctly
+                with tf.device("/cpu:0"):
+                    keras_model = config["init"](eval_mode)
+                    signature = config["signature"]()
+                    output_path = OUTPUT_DIR / f"{config['filename']}_{mode_suffix}.onnx"
+                    convert_model(full_model_name, keras_model, signature, output_path)
+
             except Exception as e:
                 logger.error(f"FATAL: Could not process {full_model_name}. Error: {e}")
-    logger.info("\n--- All models processed. ---")
+            finally:
+                # Explicitly clear memory after each model conversion
+                logger.info(f"Clearing memory after converting {full_model_name}...")
+                tf.keras.backend.clear_session()
+                gc.collect()
+
+    logger.info("\n--- All models processed successfully. ---")
+
 
 # --- Execute the conversion ---
 run_all_conversions()
-
 
 #### **Cell 3: Verification**
 

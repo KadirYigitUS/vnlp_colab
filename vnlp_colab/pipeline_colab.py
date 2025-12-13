@@ -1,19 +1,8 @@
 # vnlp_colab/pipeline_colab.py
 # coding=utf-8
-#
 # Copyright 2025 VNLP Project Authors.
-#
-# Licensed under the GNU Affero General Public License, Version 3.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.gnu.org/licenses/agpl-3.0.html
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Licensed under AGPL-3.0
+
 """
 Unified NLP Pipeline for VNLP Colab.
 
@@ -22,6 +11,7 @@ dataset, including PoS tagging, NER, dependency parsing, sentiment analysis,
 and morphological analysis. It is architected for high-performance, batched
 inference using tf.data.
 """
+
 import logging
 import re
 import time
@@ -59,8 +49,6 @@ class VNLPipeline:
             models_to_load (List[str]): Models to init. Format: ['task'] or ['task:model_name'].
                 Examples: ['pos', 'ner', 'dep:TreeStackDP', 'stemmer', 'sentiment']
         """
-        # The setup_logging call is still useful for initial setup, but the user
-        # can now control the verbosity from their script.
         setup_logging()
         logger.info("Initializing VNLP Pipeline...")
         self.models: Dict[str, Any] = {}
@@ -87,6 +75,7 @@ class VNLPipeline:
         logger.info(f"Resolved model loading order: {list(model_map.keys())}")
 
         # --- Model Loading with Dependency Injection ---
+        # Singleton factories ensure models are loaded only once
         if 'stemmer' in model_map:
             self.models['stemmer'] = get_stemmer_analyzer()
         
@@ -102,38 +91,69 @@ class VNLPipeline:
         if 'sentiment' in model_map:
             self.models['sentiment'] = SentimentAnalyzer()
         
+        # Normalizer injects stemmer if available to share resources
         self.normalizer = Normalizer(stemmer_analyzer_instance=self.models.get('stemmer'))
         
         logger.info(f"Pipeline initialized successfully with models: {list(self.models.keys())}")
 
     def load_from_csv(self, file_path: str, pickle_path: str) -> pd.DataFrame:
+        """Loads data from a tab-separated CSV file."""
         logger.info(f"Loading data from '{file_path}'...")
+        # The input format is strictly controlled by the automation script
         df = pd.read_csv(
             file_path, sep='\t', header=None,
             names=['t_code', 'ch_no', 'p_no', 's_no', 'sentence'],
             dtype={'sentence': 'string'}
         )
+        # Create an initial backup
         logger.info(f"Loaded {len(df)} records. Saving initial pickle to '{pickle_path}'...")
         df.to_pickle(pickle_path)
         return df
 
     def run_preprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Runs vectorizable preprocessing steps: cleanup, normalization, tokenization.
+        Adds 'tokens_40' column for legacy compatibility and DP batching.
+        """
         logger.info("Starting preprocessing (using vectorized pandas operations)...")
+        
+        # 1. Clean Text: Remove extra whitespace and ensure string type
         df['sentence'] = df['sentence'].str.replace(r'\s+', ' ', regex=True).str.strip().fillna("")
-        df.dropna(subset=['sentence'], inplace=True)
+        
+        # Filter empty lines immediately
+        initial_len = len(df)
+        df = df[df['sentence'].str.len() > 0].copy()
+        if len(df) < initial_len:
+            logger.warning(f"Dropped {initial_len - len(df)} empty rows.")
+        
         df.reset_index(drop=True, inplace=True)
-        logger.info("Step 1/3: Cleaned 'sentence' column.")
+        logger.info("Step 1/4: Cleaned 'sentence' column.")
         
+        # 2. Normalize: Remove accent marks
         df['no_accents'] = df['sentence'].progress_apply(self.normalizer.remove_accent_marks)
-        logger.info("Step 2/3: Created 'no_accents' column.")
+        logger.info("Step 2/4: Created 'no_accents' column.")
         
+        # 3. Tokenize: Use Treebank tokenizer
         df['tokens'] = df['no_accents'].progress_apply(TreebankWordTokenize)
-        logger.info("Step 3/3: Created 'tokens' column.")
+        logger.info("Step 3/4: Created 'tokens' column.")
+
+        # 4. Create tokens_40: Split tokens into chunks of 40
+        # This explicitly handles the model limitation in the data structure
+        # Returns List[List[str]] e.g. [['tok1'...'tok40'], ['tok41'...'tok50']]
+        def chunk_tokens(tokens):
+            if not tokens:
+                return []
+            return [tokens[i:i + 40] for i in range(0, len(tokens), 40)]
+
+        df['tokens_40'] = df['tokens'].progress_apply(chunk_tokens)
+        logger.info("Step 4/4: Created 'tokens_40' column.")
+        
         return df
 
     def _dataframe_generator(self, df: pd.DataFrame) -> Generator[Tuple[tf.Tensor, tf.Tensor], None, None]:
         """A generator that yields data needed for batch processing."""
         for _, row in df.iterrows():
+            # Yield tokens and sentence text
             yield (
                 tf.constant(row['tokens'], dtype=tf.string),
                 tf.constant(row['sentence'], dtype=tf.string)
@@ -149,41 +169,59 @@ class VNLPipeline:
             
         logger.info(f"Starting NLP model analysis with batch size {batch_size}...")
         
+        # Create a TensorFlow dataset from the DataFrame
         dataset = tf.data.Dataset.from_generator(
             lambda: self._dataframe_generator(df),
             output_signature=(
-                tf.TensorSpec(shape=(None,), dtype=tf.string),
-                tf.TensorSpec(shape=(), dtype=tf.string)
+                tf.TensorSpec(shape=(None,), dtype=tf.string), # Variable length tokens
+                tf.TensorSpec(shape=(), dtype=tf.string)       # Scalar sentence
             )
         )
         
+        # Batching with padding allows variable length sentences in one batch
         dataset = dataset.padded_batch(
             batch_size,
             padded_shapes=([None], []),
-            padding_values=("<pad>", "")
+            padding_values=(b"<pad>", b"")
         )
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
+        # Initialize results storage
         all_results = {task: [] for task in self.models.keys()}
         if 'sentiment' in self.models:
             all_results['sentiment_proba'] = []
 
         num_batches = (len(df) + batch_size - 1) // batch_size
+        
+        # --- Batch Processing Loop ---
         for batch_tokens_tf, batch_sentences_tf in tqdm(dataset, total=num_batches, desc="Processing Batches"):
-            batch_tokens = [[tok.decode('utf-8') for tok in sent if tok.decode('utf-8') != '<pad>'] for sent in batch_tokens_tf.numpy()]
+            # Convert TF tensors back to Python lists for models that expect lists
+            # Decode bytes to strings and remove padding
+            batch_tokens = [
+                [tok.decode('utf-8') for tok in sent if tok.decode('utf-8') != '<pad>'] 
+                for sent in batch_tokens_tf.numpy()
+            ]
             batch_sentences = [s.decode('utf-8') for s in batch_sentences_tf.numpy()]
             
+            # Execute models in parallel/sequence for this batch
             if 'sentiment' in self.models:
                 all_results['sentiment_proba'].extend(self.models['sentiment'].predict_proba_batch(batch_sentences))
+            
             if 'stemmer' in self.models:
                 all_results['stemmer'].extend(self.models['stemmer'].predict_batch(batch_tokens))
+            
             if 'pos' in self.models:
                 all_results['pos'].extend(self.models['pos'].predict_batch(batch_tokens))
+            
             if 'ner' in self.models:
                 all_results['ner'].extend(self.models['ner'].predict_batch(batch_sentences, batch_tokens))
+            
             if 'dep' in self.models:
+                # The updated DependencyParser (dep_colab.py) handles explicit chunking internally
+                # to avoid broadcasting errors with sentences > 40 tokens.
                 all_results['dep'].extend(self.models['dep'].predict_batch(batch_tokens))
 
+        # --- Reassemble DataFrame ---
         logger.info("Assigning batch results back to DataFrame...")
         df_index = df.index
         
@@ -192,12 +230,14 @@ class VNLPipeline:
 
         if 'stemmer' in all_results:
             df.loc[df_index, 'morph'] = pd.Series(all_results['stemmer'], index=df_index)
-            logger.info("Deriving Lemmas from morphological analysis...")
+            # Derive Lemma from Morphological Analysis
+            logger.info("Deriving Lemmas...")
             df['lemma'] = df['morph'].apply(
                 lambda morph_list: [m.split("+")[0] for m in morph_list if '+' in m] if isinstance(morph_list, list) else []
             )
 
         if 'pos' in all_results:
+            # Flatten tuples to just tags for final output
             df.loc[df_index, 'pos_tuples'] = pd.Series(all_results['pos'], index=df_index)
             df['pos'] = df['pos_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
         
@@ -206,9 +246,11 @@ class VNLPipeline:
             df['ner'] = df['ner_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
         
         if 'dep' in all_results:
+            # Flatten tuples to (head, label)
             df.loc[df_index, 'dep_tuples'] = pd.Series(all_results['dep'], index=df_index)
             df['dep'] = df['dep_tuples'].apply(lambda tuples: [(head, label) for _, _, head, label in tuples] if isinstance(tuples, list) else [])
 
+        # Cleanup intermediate columns
         cols_to_drop = [col for col in ['pos_tuples', 'ner_tuples', 'dep_tuples'] if col in df.columns]
         if cols_to_drop:
             df = df.drop(columns=cols_to_drop)
@@ -218,32 +260,37 @@ class VNLPipeline:
 
     def run(self, csv_path: str, output_pickle_path: str, batch_size: int = 32) -> pd.DataFrame:
         """Executes the full pipeline: load, preprocess, analyze, and save."""
+        
+        # 1. Load
         df_initial = self.load_from_csv(csv_path, f"{Path(output_pickle_path).stem}.initial.pkl")
+        
+        # 2. Preprocess
         df_preprocessed = self.run_preprocessing(df_initial)
         
-        logger.info("Optimizing batching efficiency by sorting data by sentence length...")
+        # 3. Sort for Batch Efficiency (sentences of similar length together minimize padding)
+        logger.info("Sorting data by sentence length for batching efficiency...")
         original_index = df_preprocessed.index
         df_preprocessed['token_len'] = df_preprocessed['tokens'].str.len()
         df_preprocessed.sort_values('token_len', inplace=True, kind='mergesort')
         df_preprocessed.drop(columns=['token_len'], inplace=True)
         
+        # 4. Process
         start_time = time.time()
         df_processed = self.process_dataframe(df_preprocessed, batch_size)
         end_time = time.time()
         
+        # 5. Restore Order
         logger.info("Restoring original sentence order...")
         df_final = df_processed.reindex(original_index).sort_index()
         
+        # 6. Report & Save
         duration = end_time - start_time
-        rows_per_second = len(df_final) / duration if duration > 0 else float('inf')
-        
-        # --- FIX: Changed from logger.info to print() for guaranteed visibility ---
-        print("\n--- Performance Summary ---")
-        print(f"Total processing time: {duration:.2f} seconds for {len(df_final)} rows.")
-        print(f"Throughput: {rows_per_second:.2f} rows/sec")
-        print(f"--------------------------\n")
+        rows_per_second = len(df_final) / duration if duration > 0 else 0
+        print(f"\n--- Performance ---")
+        print(f"Time: {duration:.2f}s | Speed: {rows_per_second:.2f} rows/s")
+        print(f"-------------------\n")
         
         logger.info(f"Saving final processed DataFrame to '{output_pickle_path}'...")
         df_final.to_pickle(output_pickle_path)
-        logger.info("Pipeline execution finished successfully.")
+        
         return df_final
