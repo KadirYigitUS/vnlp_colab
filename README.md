@@ -66,17 +66,12 @@ print(final_df[['tokens', 'pos', 'ner', 'dep']].head())
 
 ## 🏭 Batch Automation (Production)
 
-For processing large archives of CSVs from Google Drive, use the included automation script. This script handles:
-1.  **Mirroring:** Copies files to local VM storage to avoid Drive I/O bottlenecks.
-2.  **Sanitization:** Fixes malformed CSVs (missing columns) automatically.
-3.  **Archiving:** Zips results immediately to save space.
-4.  **Backup:** Uploads only the final ZIPs to Drive.
+For processing large archives of CSVs from Google Drive, use an automation script. This script should handle:
+1.  **Mirroring:** Copy files to local VM storage to avoid Drive I/O bottlenecks.
+2.  **Sanitization:** Fix malformed CSVs (missing columns) automatically.
+3.  **Archiving:** Zip results immediately to save space.
+4.  **Backup:** Upload only the final ZIPs to save space.
 
-**Setup in Drive:**
-Ensure your Drive folder (`/content/drive/MyDrive/BA_Database/CSV_TR`) contains the raw `.csv` files.
-
-**Run the Automation Script:**
-Copy the code from `COLAB_VNLP_automation_pipeline_2.py` into a Colab cell and execute.
 
 ---
 
@@ -88,7 +83,8 @@ The pipeline generates a DataFrame with the following columns:
 | :--- | :--- |
 | `t_code`, `ch_no`, ... | Original metadata columns. |
 | `sentence` | Cleaned raw text. |
-| `tokens` | List of string tokens (Treebank tokenizer). |
+| `tokens` | List of string tokens . |
+| `tokens_40` | List of token lists with len 40. |
 | `pos` | List of Part-of-Speech tags (e.g., `NOUN`, `VERB`). |
 | `ner` | List of Named Entity tags (e.g., `B-PER`, `O`). |
 | `dep` | List of dependency tuples `(head_index, relation)`. |
