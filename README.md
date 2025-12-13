@@ -84,9 +84,9 @@ The pipeline generates a DataFrame with the following columns:
 | `t_code`, `ch_no`, ... | Original metadata columns. |
 | `sentence` | Cleaned raw text. |
 | `tokens` | List of string tokens . |
-| `tokens_40` | List of token lists with len 40. |
+| `tokens_40` | List of token lists with len <= 40. |
 | `pos` | List of Part-of-Speech tags (e.g., `NOUN`, `VERB`). |
-| `ner` | List of Named Entity tags (e.g., `B-PER`, `O`). |
+| `ner` | List of Named Entity tags (e.g., `PER`, `O`). |
 | `dep` | List of dependency tuples `(head_index, relation)`. |
 | `morph` | List of morphological analysis strings. |
 | `lemma` | List of root words derived from morphological analysis. |
