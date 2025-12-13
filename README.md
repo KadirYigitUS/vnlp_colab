@@ -3,7 +3,7 @@
 **🔧 Summary of Changes:**
 *   **Installation Instructions:** Updated to highlight the critical "Restart Runtime" step required after installing dependencies (due to `protobuf` updates).
 *   **Pipeline Usage:** Reflected the new `VNLPipeline` API and the `batch_size` parameter.
-*   **Automation Guide:** Added a dedicated section for the `COLAB_VNLP_automation_pipeline_2.py` workflow, explaining the Drive directory structure and the benefits of the new mirroring/zipping strategy.
+*   **Automation Guide:** Added a dedicated section for an automation workflow, -- the new mirroring/zipping strategy for a save space.
 *   **Architecture Specs:** Updated to mention the `tf.data` streaming and "Tokenize Once" optimizations.
 
 # VNLP Colab: High-Performance Turkish NLP Pipeline
