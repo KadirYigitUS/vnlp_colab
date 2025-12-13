@@ -6,10 +6,12 @@
 """
 Unified NLP Pipeline for VNLP Colab.
 
-This module provides a high-level API to run a sequence of NLP tasks on a
-dataset, including PoS tagging, NER, dependency parsing, sentiment analysis,
-and morphological analysis. It is architected for high-performance, batched
-inference using tf.data.
+This module provides the high-level orchestration for the NLP pipeline.
+It implements the "Explode-Process-Implode" pattern to handle token limitations:
+1. Sentences are chunked into 40-token segments (`tokens_40`).
+2. Data is exploded so each chunk becomes a processing unit.
+3. Batch inference runs on chunks.
+4. Results are re-aggregated to the original sentence level.
 """
 
 import logging
@@ -19,10 +21,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Set, Generator, Tuple
 
 import pandas as pd
+import numpy as np
 import tensorflow as tf
 from tqdm.notebook import tqdm
 
-# Updated imports for package structure
 from vnlp_colab.utils_colab import setup_logging
 from vnlp_colab.tokenizer_colab import TreebankWordTokenize
 from vnlp_colab.normalizer.normalizer_colab import Normalizer
@@ -38,16 +40,12 @@ tqdm.pandas()
 
 class VNLPipeline:
     """
-    Orchestrates a full NLP analysis pipeline for a given dataset, optimized
-    for high-throughput batch processing.
+    Orchestrates the NLP analysis pipeline.
     """
     def __init__(self, models_to_load: List[str]):
         """
-        Initializes the pipeline and loads the required models into memory.
-
         Args:
-            models_to_load (List[str]): Models to init. Format: ['task'] or ['task:model_name'].
-                Examples: ['pos', 'ner', 'dep:TreeStackDP', 'stemmer', 'sentiment']
+            models_to_load: List of keys e.g. ['pos', 'ner', 'dep', 'stemmer', 'sentiment']
         """
         setup_logging()
         logger.info("Initializing VNLP Pipeline...")
@@ -55,242 +53,215 @@ class VNLPipeline:
         
         # --- Dependency Resolution ---
         resolved_models: Set[str] = set(models_to_load)
-        model_map: Dict[str, str] = {}
+        # TreeStack models imply dependencies
+        for m in models_to_load:
+            if 'TreeStackDP' in m: resolved_models.add('pos:TreeStackPoS')
+            if 'TreeStackPoS' in m: resolved_models.add('stemmer')
 
-        for model_str in models_to_load:
-            parts = model_str.split(':')
-            task = parts[0]
-            model_name = parts[1] if len(parts) > 1 else None
-            
-            if task == 'dep' and model_name == 'TreeStackDP':
-                resolved_models.add('pos:TreeStackPoS')
-            if task == 'pos' and model_name == 'TreeStackPoS':
-                resolved_models.add('stemmer')
-
-        for model_str in resolved_models:
-            parts = model_str.split(':')
-            task, model_name = (parts[0], parts[1]) if len(parts) > 1 else (parts[0], None)
-            model_map[task] = model_name
-
+        model_map = {m.split(':')[0]: (m.split(':')[1] if ':' in m else None) for m in resolved_models}
         logger.info(f"Resolved model loading order: {list(model_map.keys())}")
 
-        # --- Model Loading with Dependency Injection ---
-        # Singleton factories ensure models are loaded only once
+        # --- Singleton Model Loading ---
         if 'stemmer' in model_map:
             self.models['stemmer'] = get_stemmer_analyzer()
-        
         if 'pos' in model_map:
             self.models['pos'] = PoSTagger(model=(model_map['pos'] or 'SPUContextPoS'))
-        
         if 'dep' in model_map:
             self.models['dep'] = DependencyParser(model=(model_map['dep'] or 'SPUContextDP'))
-            
         if 'ner' in model_map:
             self.models['ner'] = NamedEntityRecognizer(model=(model_map['ner'] or 'SPUContextNER'))
-
         if 'sentiment' in model_map:
             self.models['sentiment'] = SentimentAnalyzer()
         
-        # Normalizer injects stemmer if available to share resources
         self.normalizer = Normalizer(stemmer_analyzer_instance=self.models.get('stemmer'))
-        
-        logger.info(f"Pipeline initialized successfully with models: {list(self.models.keys())}")
+        logger.info("Pipeline initialized.")
 
     def load_from_csv(self, file_path: str, pickle_path: str) -> pd.DataFrame:
-        """Loads data from a tab-separated CSV file."""
+        """Loads tab-separated CSV and saves initial backup."""
         logger.info(f"Loading data from '{file_path}'...")
-        # The input format is strictly controlled by the automation script
         df = pd.read_csv(
             file_path, sep='\t', header=None,
             names=['t_code', 'ch_no', 'p_no', 's_no', 'sentence'],
             dtype={'sentence': 'string'}
         )
-        # Create an initial backup
-        logger.info(f"Loaded {len(df)} records. Saving initial pickle to '{pickle_path}'...")
+        logger.info(f"Loaded {len(df)} records. Saving backup to '{pickle_path}'...")
         df.to_pickle(pickle_path)
         return df
 
     def run_preprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Runs vectorizable preprocessing steps: cleanup, normalization, tokenization.
-        Adds 'tokens_40' column for legacy compatibility and DP batching.
+        Cleaning, normalization, tokenization, and chunking (tokens_40).
         """
-        logger.info("Starting preprocessing (using vectorized pandas operations)...")
+        logger.info("Starting preprocessing...")
         
-        # 1. Clean Text: Remove extra whitespace and ensure string type
+        # 1. Clean
         df['sentence'] = df['sentence'].str.replace(r'\s+', ' ', regex=True).str.strip().fillna("")
+        df = df[df['sentence'].str.len() > 0].copy().reset_index(drop=True)
         
-        # Filter empty lines immediately
-        initial_len = len(df)
-        df = df[df['sentence'].str.len() > 0].copy()
-        if len(df) < initial_len:
-            logger.warning(f"Dropped {initial_len - len(df)} empty rows.")
-        
-        df.reset_index(drop=True, inplace=True)
-        logger.info("Step 1/4: Cleaned 'sentence' column.")
-        
-        # 2. Normalize: Remove accent marks
+        # 2. Normalize
         df['no_accents'] = df['sentence'].progress_apply(self.normalizer.remove_accent_marks)
-        logger.info("Step 2/4: Created 'no_accents' column.")
         
-        # 3. Tokenize: Use Treebank tokenizer
+        # 3. Tokenize
         df['tokens'] = df['no_accents'].progress_apply(TreebankWordTokenize)
-        logger.info("Step 3/4: Created 'tokens' column.")
 
-        # 4. Create tokens_40: Split tokens into chunks of 40
-        # This explicitly handles the model limitation in the data structure
-        # Returns List[List[str]] e.g. [['tok1'...'tok40'], ['tok41'...'tok50']]
+        # 4. Chunk (tokens_40)
+        # Creates a List[List[str]], e.g., [['word1'...'word40'], ['word41'...]]
         def chunk_tokens(tokens):
-            if not tokens:
-                return []
+            if not tokens: return []
             return [tokens[i:i + 40] for i in range(0, len(tokens), 40)]
 
         df['tokens_40'] = df['tokens'].progress_apply(chunk_tokens)
-        logger.info("Step 4/4: Created 'tokens_40' column.")
         
+        logger.info("Preprocessing complete. 'tokens_40' column created.")
         return df
 
-    def _dataframe_generator(self, df: pd.DataFrame) -> Generator[Tuple[tf.Tensor, tf.Tensor], None, None]:
-        """A generator that yields data needed for batch processing."""
-        for _, row in df.iterrows():
-            # Yield tokens and sentence text
-            yield (
-                tf.constant(row['tokens'], dtype=tf.string),
-                tf.constant(row['sentence'], dtype=tf.string)
-            )
+    def _chunk_generator(self, df_exploded: pd.DataFrame) -> Generator[tf.Tensor, None, None]:
+        """Yields chunks for 40-token models."""
+        for tokens in df_exploded['tokens_40']:
+            yield tf.constant(tokens, dtype=tf.string)
 
     def process_dataframe(self, df: pd.DataFrame, batch_size: int = 32) -> pd.DataFrame:
         """
-        Processes a DataFrame using a high-performance tf.data batching pipeline.
+        Executes models using 'Explode -> Process -> Implode' strategy.
         """
-        if df.empty:
-            logger.warning("Input DataFrame is empty. Skipping processing.")
-            return df
-            
-        logger.info(f"Starting NLP model analysis with batch size {batch_size}...")
-        
-        # Create a TensorFlow dataset from the DataFrame
-        dataset = tf.data.Dataset.from_generator(
-            lambda: self._dataframe_generator(df),
-            output_signature=(
-                tf.TensorSpec(shape=(None,), dtype=tf.string), # Variable length tokens
-                tf.TensorSpec(shape=(), dtype=tf.string)       # Scalar sentence
-            )
-        )
-        
-        # Batching with padding allows variable length sentences in one batch
-        dataset = dataset.padded_batch(
-            batch_size,
-            padded_shapes=([None], []),
-            padding_values=(b"<pad>", b"")
-        )
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        if df.empty: return df
+        logger.info(f"Starting analysis (Batch Size: {batch_size})...")
 
-        # Initialize results storage
-        all_results = {task: [] for task in self.models.keys()}
+        # --- 1. SENTIMENT ANALYSIS (Sentence Level) ---
+        # Sentiment works on the full sentence, so we run it on the original DF
         if 'sentiment' in self.models:
-            all_results['sentiment_proba'] = []
+            logger.info("Running Sentiment Analysis (Full Sentence)...")
+            sentences = df['no_accents'].tolist()
+            # Process in simple batches
+            probs = []
+            for i in tqdm(range(0, len(sentences), batch_size), desc="Sentiment"):
+                batch = sentences[i : i + batch_size]
+                probs.extend(self.models['sentiment'].predict_proba_batch(batch))
+            df['sentiment'] = probs
 
-        num_batches = (len(df) + batch_size - 1) // batch_size
+        # --- 2. PREPARE FOR 40-TOKEN MODELS (Chunk Level) ---
+        # Explode tokens_40 so each row is a single chunk <= 40 tokens
+        # We preserve the original index to re-assemble later
+        df_exploded = df.explode('tokens_40').reset_index().rename(columns={'index': 'orig_idx'})
         
-        # --- Batch Processing Loop ---
-        for batch_tokens_tf, batch_sentences_tf in tqdm(dataset, total=num_batches, desc="Processing Batches"):
-            # Convert TF tensors back to Python lists for models that expect lists
-            # Decode bytes to strings and remove padding
+        # Filter out potential NaNs from empty token lists
+        df_exploded = df_exploded[df_exploded['tokens_40'].notna()]
+        
+        if df_exploded.empty:
+            logger.warning("No tokens found for analysis.")
+            return df
+
+        # Create Dataset for Chunks
+        dataset = tf.data.Dataset.from_generator(
+            lambda: self._chunk_generator(df_exploded),
+            output_signature=tf.TensorSpec(shape=(None,), dtype=tf.string)
+        )
+        dataset = dataset.padded_batch(
+            batch_size, 
+            padded_shapes=([None]), 
+            padding_values=b"<pad>"
+        ).prefetch(tf.data.AUTOTUNE)
+
+        # Storage for chunk results
+        results_map = {k: [] for k in ['stemmer', 'pos', 'ner', 'dep'] if k in self.models}
+
+        # --- 3. BATCH INFERENCE ---
+        num_batches = (len(df_exploded) + batch_size - 1) // batch_size
+        
+        for batch_tf in tqdm(dataset, total=num_batches, desc="Processing Chunks"):
+            # Decode tensors to lists of strings
             batch_tokens = [
-                [tok.decode('utf-8') for tok in sent if tok.decode('utf-8') != '<pad>'] 
-                for sent in batch_tokens_tf.numpy()
+                [t.decode('utf-8') for t in sent if t.decode('utf-8') != '<pad>'] 
+                for sent in batch_tf.numpy()
             ]
-            batch_sentences = [s.decode('utf-8') for s in batch_sentences_tf.numpy()]
             
-            # Execute models in parallel/sequence for this batch
-            if 'sentiment' in self.models:
-                all_results['sentiment_proba'].extend(self.models['sentiment'].predict_proba_batch(batch_sentences))
-            
+            # Since these are chunks, 'sentences' for NER are just joined tokens
+            batch_sentences_approx = [" ".join(t) for t in batch_tokens]
+
             if 'stemmer' in self.models:
-                all_results['stemmer'].extend(self.models['stemmer'].predict_batch(batch_tokens))
+                results_map['stemmer'].extend(self.models['stemmer'].predict_batch(batch_tokens))
             
             if 'pos' in self.models:
-                all_results['pos'].extend(self.models['pos'].predict_batch(batch_tokens))
-            
+                results_map['pos'].extend(self.models['pos'].predict_batch(batch_tokens))
+                
             if 'ner' in self.models:
-                all_results['ner'].extend(self.models['ner'].predict_batch(batch_sentences, batch_tokens))
-            
+                results_map['ner'].extend(self.models['ner'].predict_batch(batch_sentences_approx, batch_tokens))
+                
             if 'dep' in self.models:
-                # The updated DependencyParser (dep_colab.py) handles explicit chunking internally
-                # to avoid broadcasting errors with sentences > 40 tokens.
-                all_results['dep'].extend(self.models['dep'].predict_batch(batch_tokens))
+                # Dependency Parser now receives safe 40-token batches
+                results_map['dep'].extend(self.models['dep'].predict_batch(batch_tokens))
 
-        # --- Reassemble DataFrame ---
-        logger.info("Assigning batch results back to DataFrame...")
-        df_index = df.index
+        # --- 4. ASSIGN RESULTS TO EXPLODED DF ---
+        if 'stemmer' in results_map:
+            df_exploded['morph'] = results_map['stemmer']
+        if 'pos' in results_map:
+            df_exploded['pos'] = results_map['pos']
+        if 'ner' in results_map:
+            df_exploded['ner'] = results_map['ner']
+        if 'dep' in results_map:
+            df_exploded['dep'] = results_map['dep']
+
+        # --- 5. IMPLODE (AGGREGATE) BACK TO ORIGINAL ROWS ---
+        logger.info("Aggregating chunk results...")
         
-        if 'sentiment_proba' in all_results:
-            df.loc[df_index, 'sentiment'] = all_results['sentiment_proba']
+        # We group by the original index and sum the lists (concatenation)
+        agg_funcs = {}
+        if 'stemmer' in self.models: agg_funcs['morph'] = 'sum'
+        if 'pos' in self.models: agg_funcs['pos'] = 'sum'
+        if 'ner' in self.models: agg_funcs['ner'] = 'sum'
+        if 'dep' in self.models: agg_funcs['dep'] = 'sum'
 
-        if 'stemmer' in all_results:
-            df.loc[df_index, 'morph'] = pd.Series(all_results['stemmer'], index=df_index)
-            # Derive Lemma from Morphological Analysis
+        if agg_funcs:
+            # GroupBy sums the lists: [chunk1_res] + [chunk2_res] -> [full_res]
+            df_imploded = df_exploded.groupby('orig_idx').agg(agg_funcs)
+            
+            # Merge back into original DF
+            df = df.join(df_imploded)
+
+        # --- 6. POST-PROCESSING (Lemmas & formatting) ---
+        if 'stemmer' in self.models and 'morph' in df.columns:
             logger.info("Deriving Lemmas...")
             df['lemma'] = df['morph'].apply(
-                lambda morph_list: [m.split("+")[0] for m in morph_list if '+' in m] if isinstance(morph_list, list) else []
+                lambda x: [m.split("+")[0] for m in x if isinstance(m, str) and '+' in m] 
+                if isinstance(x, list) else []
             )
 
-        if 'pos' in all_results:
-            # Flatten tuples to just tags for final output
-            df.loc[df_index, 'pos_tuples'] = pd.Series(all_results['pos'], index=df_index)
-            df['pos'] = df['pos_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
+        # Flatten tuples for cleaner output (Pos/Dep/Ner usually return tuples)
+        if 'pos' in df.columns:
+            # POS returns (token, tag) -> extract tag
+            df['pos'] = df['pos'].apply(lambda x: [item[1] for item in x] if isinstance(x, list) else [])
         
-        if 'ner' in all_results:
-            df.loc[df_index, 'ner_tuples'] = pd.Series(all_results['ner'], index=df_index)
-            df['ner'] = df['ner_tuples'].apply(lambda tuples: [tag for _, tag in tuples] if isinstance(tuples, list) else [])
-        
-        if 'dep' in all_results:
-            # Flatten tuples to (head, label)
-            df.loc[df_index, 'dep_tuples'] = pd.Series(all_results['dep'], index=df_index)
-            df['dep'] = df['dep_tuples'].apply(lambda tuples: [(head, label) for _, _, head, label in tuples] if isinstance(tuples, list) else [])
+        if 'ner' in df.columns:
+            # NER returns (token, tag) -> extract tag
+            df['ner'] = df['ner'].apply(lambda x: [item[1] for item in x] if isinstance(x, list) else [])
+            
+        if 'dep' in df.columns:
+            # DEP returns (id, word, head, rel) -> extract (head, rel)
+            # CAUTION: Head indices in chunks (0-40) need adjustment if we wanted global indices.
+            # However, standard DP behavior on chunks implies local heads. 
+            # We keep local heads for now as global re-linking is complex without a graph parser.
+            df['dep'] = df['dep'].apply(lambda x: [(item[2], item[3]) for item in x] if isinstance(x, list) else [])
 
-        # Cleanup intermediate columns
-        cols_to_drop = [col for col in ['pos_tuples', 'ner_tuples', 'dep_tuples'] if col in df.columns]
-        if cols_to_drop:
-            df = df.drop(columns=cols_to_drop)
-
-        logger.info("NLP model analysis complete.")
         return df
 
     def run(self, csv_path: str, output_pickle_path: str, batch_size: int = 32) -> pd.DataFrame:
-        """Executes the full pipeline: load, preprocess, analyze, and save."""
-        
-        # 1. Load
         df_initial = self.load_from_csv(csv_path, f"{Path(output_pickle_path).stem}.initial.pkl")
+        df_prep = self.run_preprocessing(df_initial)
         
-        # 2. Preprocess
-        df_preprocessed = self.run_preprocessing(df_initial)
+        # Sort by length of 'tokens' (flattened count) for efficiency
+        df_prep['len'] = df_prep['tokens'].str.len()
+        df_prep.sort_values('len', inplace=True)
         
-        # 3. Sort for Batch Efficiency (sentences of similar length together minimize padding)
-        logger.info("Sorting data by sentence length for batching efficiency...")
-        original_index = df_preprocessed.index
-        df_preprocessed['token_len'] = df_preprocessed['tokens'].str.len()
-        df_preprocessed.sort_values('token_len', inplace=True, kind='mergesort')
-        df_preprocessed.drop(columns=['token_len'], inplace=True)
+        start = time.time()
+        df_final = self.process_dataframe(df_prep, batch_size)
+        duration = time.time() - start
         
-        # 4. Process
-        start_time = time.time()
-        df_processed = self.process_dataframe(df_preprocessed, batch_size)
-        end_time = time.time()
+        # Restore order
+        df_final.sort_index(inplace=True)
+        df_final.drop(columns=['len'], errors='ignore', inplace=True)
         
-        # 5. Restore Order
-        logger.info("Restoring original sentence order...")
-        df_final = df_processed.reindex(original_index).sort_index()
+        print(f"Processing finished in {duration:.2f}s ({len(df_final)/duration:.1f} rows/s)")
         
-        # 6. Report & Save
-        duration = end_time - start_time
-        rows_per_second = len(df_final) / duration if duration > 0 else 0
-        print(f"\n--- Performance ---")
-        print(f"Time: {duration:.2f}s | Speed: {rows_per_second:.2f} rows/s")
-        print(f"-------------------\n")
-        
-        logger.info(f"Saving final processed DataFrame to '{output_pickle_path}'...")
+        logger.info(f"Saving to {output_pickle_path}")
         df_final.to_pickle(output_pickle_path)
-        
         return df_final

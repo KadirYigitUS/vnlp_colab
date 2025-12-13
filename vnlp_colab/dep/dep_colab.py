@@ -9,9 +9,10 @@ Dependency Parser (DP) module for VNLP Colab.
 This module provides the high-level DependencyParser API and implementations
 for SPUContextDP and the dependency-aware TreeStackDP.
 
-CRITICAL UPDATE:
-- Implements automatic chunking for sentences > 40 tokens to prevent
-  TensorFlow graph broadcasting errors.
+ARCHITECTURAL UPDATE:
+- Internal chunking logic removed. This model now expects inputs to be
+  pre-chunked (max len 40) by the upstream VNLPipeline.
+- Enforces strict shape compliance for the TF graph.
 """
 
 import logging
@@ -65,7 +66,7 @@ _MODEL_INSTANCE_CACHE: Dict[str, Any] = {}
 class SPUContextDP:
     """
     SentencePiece Unigram Context Dependency Parser.
-    Optimized with tf.function and chunking for high-performance inference.
+    Optimized for batch inference on chunks <= 40 tokens.
     """
     def __init__(self, evaluate: bool = False):
         logger.info(f"Initializing SPUContextDP model (evaluate={evaluate})...")
@@ -127,42 +128,35 @@ class SPUContextDP:
         if not any(batch_of_tokens):
             return [[] for _ in batch_of_tokens]
 
-        # --- STEP 1: CHUNKING LOGIC ---
-        # The model accepts max 40 tokens. We must flatten the batch into chunks <= 40.
-        chunked_batch = []
-        mapping_info = [] # Stores (original_index, start_offset) for reconstruction
-
-        for i, tokens in enumerate(batch_of_tokens):
-            if not tokens:
-                continue
-            
-            # Split tokens into chunks of 40
-            for chunk_start in range(0, len(tokens), 40):
-                chunk = tokens[chunk_start : chunk_start + 40]
-                chunked_batch.append(chunk)
-                mapping_info.append((i, chunk_start))
-
-        if not chunked_batch:
-            return [[] for _ in batch_of_tokens]
-
-        # --- STEP 2: BATCH INFERENCE ON CHUNKS ---
-        chunk_batch_size = len(chunked_batch)
-        # We know chunks are <= 40, so max_len is safe
-        max_len = max(len(c) for c in chunked_batch)
+        batch_size = len(batch_of_tokens)
+        max_limit = self.params_config['sentence_max_len'] # 40
         
-        # Prepare result containers for chunks
-        chunk_arcs = [[] for _ in range(chunk_batch_size)]
-        chunk_labels = [[] for _ in range(chunk_batch_size)]
+        # Validation: Ensure strict adherence to length limit
+        # The pipeline should have already chunked these.
+        processed_batch = []
+        for seq in batch_of_tokens:
+            if len(seq) > max_limit:
+                # Fallback safety: Truncate if pipeline failed to chunk
+                processed_batch.append(seq[:max_limit])
+            else:
+                processed_batch.append(seq)
+        
+        # Batch inference
+        # We process 'max_len' steps, where max_len <= 40
+        max_len = max(len(s) for s in processed_batch) if processed_batch else 0
+        
+        batch_arcs = [[] for _ in range(batch_size)]
+        batch_labels = [[] for _ in range(batch_size)]
 
         for t in range(max_len):
             active_indices, word_batch, left_ctx_batch, right_ctx_batch, lc_hist_batch = [], [], [], [], []
             
-            for i in range(chunk_batch_size):
-                if t < len(chunked_batch[i]):
+            for i in range(batch_size):
+                if t < len(processed_batch[i]):
                     active_indices.append(i)
                     inputs_np = process_dp_input(
-                        t, chunked_batch[i], self.spu_tokenizer_word, self.tokenizer_label,
-                        self.arc_label_vector_len, chunk_arcs[i], chunk_labels[i]
+                        t, processed_batch[i], self.spu_tokenizer_word, self.tokenizer_label,
+                        self.arc_label_vector_len, batch_arcs[i], batch_labels[i]
                     )
                     word_batch.append(inputs_np[0])
                     left_ctx_batch.append(inputs_np[1])
@@ -183,45 +177,19 @@ class SPUContextDP:
             
             for i, logits in enumerate(logits_batch):
                 original_index = active_indices[i]
-                arc, label = decode_arc_label_vector(logits, self.params_config['sentence_max_len'], self.label_vocab_size)
-                chunk_arcs[original_index].append(arc)
-                chunk_labels[original_index].append(label)
+                arc, label = decode_arc_label_vector(logits, max_limit, self.label_vocab_size)
+                batch_arcs[original_index].append(arc)
+                batch_labels[original_index].append(label)
         
-        # --- STEP 3: RECONSTRUCTION ---
-        final_results = [[] for _ in range(len(batch_of_tokens))]
-        
-        for i, (orig_idx, offset) in enumerate(mapping_info):
-            chunk_tokens = chunked_batch[i]
-            chunk_arc_ids = chunk_arcs[i]
-            chunk_label_ids = chunk_labels[i]
-            
-            labels_str = self.tokenizer_label.sequences_to_texts([[lbl] for lbl in chunk_label_ids])
-            
-            chunk_result = []
-            for idx, (token, label) in enumerate(zip(chunk_tokens, labels_str)):
-                # Adjust Head Index:
-                # The model predicts heads relative to the chunk (0..40).
-                # We need to map this back to the absolute sentence position if possible.
-                # However, dependency parsers usually can't predict heads outside their window.
-                # We keep the relative head prediction but note the offset for the token ID.
-                # Absolute token ID = offset + idx + 1
-                
-                # Note on Head Adjustment: 
-                # If predicted head is 0 (ROOT), it stays 0.
-                # If predicted head is > 0, it means "the Xth token in this chunk".
-                # Technically, this head points to local chunk index. 
-                # Converting to absolute index requires assuming the head is inside the chunk.
-                head_idx = chunk_arc_ids[idx]
-                if head_idx > 0:
-                    head_idx += offset
-                
-                chunk_result.append(
-                    (offset + idx + 1, token, head_idx, label or "UNK")
-                )
-            
-            final_results[orig_idx].extend(chunk_result)
+        final_results = []
+        for i in range(batch_size):
+            labels_str = self.tokenizer_label.sequences_to_texts([[lbl] for lbl in batch_labels[i]])
+            result = [(idx + 1, token, batch_arcs[i][idx], label or "UNK")
+                      for idx, (token, label) in enumerate(zip(processed_batch[i], labels_str))]
+            final_results.append(result)
 
         return final_results
+
 
 class TreeStackDP:
     """Implementation for the TreeStack Dependency Parser."""
@@ -269,17 +237,16 @@ class TreeStackDP:
         return self.predict_batch([tokens])[0]
 
     def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[Tuple[int, str, int, str]]]:
-        # Fallback to simple batch loop for now as TreeStack architecture handles context differently
-        # and implicit chunking is complex due to dependencies on Stemmer/POS alignment.
-        # However, we implement basic truncation protection.
-        
+        # Fallback to simple batch loop for now
         final_results = []
+        limit = self.params['sentence_max_len']
+
         for tokens in batch_of_tokens:
-            # Truncate to max len if necessary to prevent crash
-            limit = self.params['sentence_max_len']
+            # Safe truncation fallback
             safe_tokens = tokens[:limit] 
             
             # --- Pipeline Dependencies ---
+            # Models process the chunk
             analyses = self.stemmer_analyzer.predict([safe_tokens])
             pos_res = self.pos_tagger.predict(safe_tokens)
             pos_tags = [tag for _, tag in pos_res]
@@ -292,18 +259,8 @@ class TreeStackDP:
                     self.params['word_form'], self.params['sentence_max_len'], self.params['tag_max_len'],
                     self.arc_label_vector_len
                 )
-                # Reshape inputs for model: list of arrays
-                model_inputs = [np.expand_dims(inp, axis=0) for inp in inputs] # Add batch dim 1
-                # Actually process_treestack_dp_input already adds batch dim, but verify shape
                 
-                # Fix: process_treestack_dp_input returns tuples of (1, ...) arrays.
-                # We need to stack them if we were doing true batching, but here we loop.
-                # Just use index 0 of the returned tuple for each input.
-                
-                # For single instance inference:
-                # The model expects a list of inputs.
-                # inputs tuple is: (word_t, tags_t, pos_t, lc_words, lc_tags, lc_pos, lc_arc, rc_words, rc_tags, rc_pos)
-                
+                # Single instance inference within batch loop
                 logits = self.model(list(inputs), training=False).numpy()[0]
                 arc, label = decode_arc_label_vector(logits, limit, len(self.tokenizer_label.word_index))
                 arcs.append(arc)
@@ -315,6 +272,7 @@ class TreeStackDP:
             final_results.append(result)
             
         return final_results
+
 
 class DependencyParser:
     """Main API class for Dependency Parser implementations."""
@@ -352,9 +310,4 @@ class DependencyParser:
         return self.instance.predict_batch(batch_of_tokens)
 
 if __name__ == "__main__":
-    from vnlp_colab.tokenizer_colab import TreebankWordTokenize
-    setup_logging()
-    parser = DependencyParser(model='SPUContextDP')
-    # Test long sentence
-    long_sent = ["word"] * 50
-    print(parser.predict(long_sent))
+    pass
