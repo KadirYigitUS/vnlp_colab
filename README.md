@@ -30,7 +30,6 @@ It addresses legacy compatibility issues and introduces a high-throughput **Batc
 
 Run the following in a Colab cell. 
 
-**⚠️ CRITICAL:** You must **Restart the Session** (Runtime > Restart Session) after installation to activate the updated `protobuf` library.
 
 ```bash
 !pip install -q git+https://github.com/KadirYigitUS/vnlp_colab.git
