@@ -15,17 +15,16 @@ It implements the "Explode-Process-Implode" pattern to handle token limitations:
 """
 
 import logging
-import re
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Set, Generator, Tuple
+from typing import Any, Dict, Generator, List, Set
 
 import pandas as pd
-import numpy as np
 import tensorflow as tf
 from tqdm.notebook import tqdm
 
 from vnlp_colab.utils_colab import setup_logging
+from vnlp_colab.dep.dep_utils_colab import chunk_token_sequence, merge_dep_chunks
 from vnlp_colab.tokenizer_colab import TreebankWordTokenize
 from vnlp_colab.normalizer.normalizer_colab import Normalizer
 from vnlp_colab.pos.pos_colab import PoSTagger
@@ -55,8 +54,10 @@ class VNLPipeline:
         resolved_models: Set[str] = set(models_to_load)
         # TreeStack models imply dependencies
         for m in models_to_load:
-            if 'TreeStackDP' in m: resolved_models.add('pos:TreeStackPoS')
-            if 'TreeStackPoS' in m: resolved_models.add('stemmer')
+            if 'TreeStackDP' in m:
+                resolved_models.add('pos:TreeStackPoS')
+            if 'TreeStackPoS' in m:
+                resolved_models.add('stemmer')
 
         model_map = {m.split(':')[0]: (m.split(':')[1] if ':' in m else None) for m in resolved_models}
         logger.info(f"Resolved model loading order: {list(model_map.keys())}")
@@ -106,12 +107,8 @@ class VNLPipeline:
 
         # 4. Chunk (tokens_40)
         # Creates a List[List[str]], e.g., [['word1'...'word40'], ['word41'...]]
-        def chunk_tokens(tokens):
-            if not tokens: return []
-            return [tokens[i:i + 40] for i in range(0, len(tokens), 40)]
+        df['tokens_40'] = df['tokens'].progress_apply(lambda t: chunk_token_sequence(t, 40))
 
-        df['tokens_40'] = df['tokens'].progress_apply(chunk_tokens)
-        
         logger.info("Preprocessing complete. 'tokens_40' column created.")
         return df
 
@@ -124,7 +121,8 @@ class VNLPipeline:
         """
         Executes models using 'Explode -> Process -> Implode' strategy.
         """
-        if df.empty: return df
+        if df.empty:
+            return df
         logger.info(f"Starting analysis (Batch Size: {batch_size})...")
 
         # --- 1. SENTIMENT ANALYSIS (Sentence Level) ---
@@ -142,7 +140,7 @@ class VNLPipeline:
         # --- 2. PREPARE FOR 40-TOKEN MODELS (Chunk Level) ---
         # Explode tokens_40 so each row is a single chunk <= 40 tokens
         # We preserve the original index to re-assemble later
-        df_exploded = df.explode('tokens_40').reset_index().rename(columns={'index': 'orig_idx'})
+        df_exploded = df.explode('tokens_40').rename_axis('orig_idx').reset_index()
         
         # Filter out potential NaNs from empty token lists
         df_exploded = df_exploded[df_exploded['tokens_40'].notna()]
@@ -206,16 +204,18 @@ class VNLPipeline:
         
         # We group by the original index and sum the lists (concatenation)
         agg_funcs = {}
-        if 'stemmer' in self.models: agg_funcs['morph'] = 'sum'
-        if 'pos' in self.models: agg_funcs['pos'] = 'sum'
-        if 'ner' in self.models: agg_funcs['ner'] = 'sum'
-        if 'dep' in self.models: agg_funcs['dep'] = 'sum'
+        if 'stemmer' in self.models:
+            agg_funcs['morph'] = 'sum'
+        if 'pos' in self.models:
+            agg_funcs['pos'] = 'sum'
+        if 'ner' in self.models:
+            agg_funcs['ner'] = 'sum'
+        if 'dep' in self.models:
+            agg_funcs['dep'] = list
 
         if agg_funcs:
-            # GroupBy sums the lists: [chunk1_res] + [chunk2_res] -> [full_res]
-            df_imploded = df_exploded.groupby('orig_idx').agg(agg_funcs)
-            
-            # Merge back into original DF
+            # GroupBy concatenates token-level cols and preserves chunk boundaries for dep
+            df_imploded = df_exploded.groupby('orig_idx', sort=False).agg(agg_funcs)
             df = df.join(df_imploded)
 
         # --- 6. POST-PROCESSING (Lemmas & formatting) ---
@@ -236,11 +236,14 @@ class VNLPipeline:
             df['ner'] = df['ner'].apply(lambda x: [item[1] for item in x] if isinstance(x, list) else [])
             
         if 'dep' in df.columns:
-            # DEP returns (id, word, head, rel) -> extract (head, rel)
-            # CAUTION: Head indices in chunks (0-40) need adjustment if we wanted global indices.
-            # However, standard DP behavior on chunks implies local heads. 
-            # We keep local heads for now as global re-linking is complex without a graph parser.
-            df['dep'] = df['dep'].apply(lambda x: [(item[2], item[3]) for item in x] if isinstance(x, list) else [])
+            # DEP returns chunked (id, word, head, rel) lists; merge offsets once per sentence
+            tok_col = df['tokens_40'] if 'tokens_40' in df.columns else [None] * len(df)
+            df['dep'] = [
+                [(item[2], item[3]) for item in merge_dep_chunks(chunks, tok_chunks)]
+                if isinstance(chunks, list)
+                else []
+                for chunks, tok_chunks in zip(df['dep'], tok_col)
+            ]
 
         return df
 

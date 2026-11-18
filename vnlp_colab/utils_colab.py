@@ -19,7 +19,7 @@ TensorFlow compatibility.
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import List, Tuple, Union
 
 # Robust package data access
 try:
@@ -30,6 +30,7 @@ except ImportError:
 
 import numpy as np
 import requests
+import sentencepiece as spm
 import tensorflow as tf
 from tqdm.notebook import tqdm
 
@@ -57,14 +58,14 @@ def setup_logging(level: int = logging.INFO) -> None:
 def get_vnlp_cache_dir() -> Path:
     """
     Returns the Path object for the VNLP cache directory.
-    Defaults to /content/vnlp_cache in a Colab environment.
+    Uses /content/vnlp_cache when /content is writable, else ~/.cache/vnlp_cache.
     """
-    cache_dir = Path("/content/vnlp_cache")
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        logger.error(f"Failed to create cache directory at {cache_dir}: {e}")
-        raise
+    colab_root = Path("/content")
+    if colab_root.is_dir() and os.access(colab_root, os.W_OK):
+        cache_dir = colab_root / "vnlp_cache"
+    else:
+        cache_dir = Path.home() / ".cache" / "vnlp_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
 def detect_hardware_strategy() -> tf.distribute.Strategy:

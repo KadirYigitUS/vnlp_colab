@@ -22,13 +22,12 @@ from typing import List, Tuple, Dict, Any, Union
 import numpy as np
 import sentencepiece as spm
 import tensorflow as tf
-from tensorflow import keras
 
 # Updated imports for package structure
 from vnlp_colab.utils_colab import download_resource, load_keras_tokenizer, get_vnlp_cache_dir, get_resource_path
 from vnlp_colab.dep.dep_utils_colab import (
-    create_spucontext_dp_model, process_dp_input,
-    decode_arc_label_vector, dp_pos_to_displacy_format
+    chunk_token_sequence, create_spucontext_dp_model, decode_arc_label_vector,
+    dp_pos_to_displacy_format, merge_dep_chunks, process_dp_input
 )
 from vnlp_colab.dep.dep_treestack_utils_colab import (
     create_treestack_dp_model, process_treestack_dp_input
@@ -100,7 +99,8 @@ class SPUContextDP:
             fc_units_multiplier=params['fc_units_multiplier'],
             dropout=params['dropout']
         )
-        with open(weights_path, 'rb') as fp: model_weights = pickle.load(fp)
+        with open(weights_path, 'rb') as fp:
+            model_weights = pickle.load(fp)
         self.model.set_weights([word_embedding_matrix] + model_weights)
         self._initialize_compiled_predict_step()
         logger.info("SPUContextDP model initialized successfully.")
@@ -128,22 +128,18 @@ class SPUContextDP:
         if not any(batch_of_tokens):
             return [[] for _ in batch_of_tokens]
 
-        batch_size = len(batch_of_tokens)
-        max_limit = self.params_config['sentence_max_len'] # 40
-        
-        # Validation: Ensure strict adherence to length limit
-        # The pipeline should have already chunked these.
-        processed_batch = []
+        max_limit = self.params_config['sentence_max_len']  # 40
+        chunked_batch: List[List[str]] = []
+        sent_ranges: List[Tuple[int, int, List[List[str]]]] = []
         for seq in batch_of_tokens:
-            if len(seq) > max_limit:
-                # Fallback safety: Truncate if pipeline failed to chunk
-                processed_batch.append(seq[:max_limit])
-            else:
-                processed_batch.append(seq)
-        
-        # Batch inference
-        # We process 'max_len' steps, where max_len <= 40
-        max_len = max(len(s) for s in processed_batch) if processed_batch else 0
+            chunks = chunk_token_sequence(seq, max_limit)
+            start = len(chunked_batch)
+            chunked_batch.extend(chunks)
+            sent_ranges.append((start, len(chunked_batch), chunks))
+
+        processed_batch = chunked_batch
+        batch_size = len(processed_batch)
+        max_len = max((len(s) for s in processed_batch), default=0)
         
         batch_arcs = [[] for _ in range(batch_size)]
         batch_labels = [[] for _ in range(batch_size)]
@@ -181,14 +177,14 @@ class SPUContextDP:
                 batch_arcs[original_index].append(arc)
                 batch_labels[original_index].append(label)
         
-        final_results = []
+        chunk_results = []
         for i in range(batch_size):
             labels_str = self.tokenizer_label.sequences_to_texts([[lbl] for lbl in batch_labels[i]])
-            result = [(idx + 1, token, batch_arcs[i][idx], label or "UNK")
-                      for idx, (token, label) in enumerate(zip(processed_batch[i], labels_str))]
-            final_results.append(result)
-
-        return final_results
+            chunk_results.append([
+                (idx + 1, token, batch_arcs[i][idx], label or "UNK")
+                for idx, (token, label) in enumerate(zip(processed_batch[i], labels_str))
+            ])
+        return [merge_dep_chunks(chunk_results[s:e], ch) if ch else [] for s, e, ch in sent_ranges]
 
 
 class TreeStackDP:
@@ -227,7 +223,8 @@ class TreeStackDP:
             tag_embedding_matrix=tag_embedding_matrix,
             **self.params
         )
-        with open(weights_path, 'rb') as fp: model_weights = pickle.load(fp)
+        with open(weights_path, 'rb') as fp:
+            model_weights = pickle.load(fp)
         self.model.set_weights([model_weights[0], word_embedding_matrix] + model_weights[1:])
         logger.info("TreeStackDP model initialized successfully.")
 
@@ -237,40 +234,40 @@ class TreeStackDP:
         return self.predict_batch([tokens])[0]
 
     def predict_batch(self, batch_of_tokens: List[List[str]]) -> List[List[Tuple[int, str, int, str]]]:
-        # Fallback to simple batch loop for now
         final_results = []
         limit = self.params['sentence_max_len']
 
         for tokens in batch_of_tokens:
-            # Safe truncation fallback
-            safe_tokens = tokens[:limit] 
-            
-            # --- Pipeline Dependencies ---
-            # Models process the chunk
-            analyses = self.stemmer_analyzer.predict([safe_tokens])
-            pos_res = self.pos_tagger.predict(safe_tokens)
-            pos_tags = [tag for _, tag in pos_res]
-            
-            arcs, labels = [], []
-            for t in range(len(safe_tokens)):
-                inputs = process_treestack_dp_input(
-                    safe_tokens, analyses, pos_tags, arcs, labels,
-                    self.tokenizer_word, self.tokenizer_morph_tag, self.tokenizer_pos, self.tokenizer_label,
-                    self.params['word_form'], self.params['sentence_max_len'], self.params['tag_max_len'],
-                    self.arc_label_vector_len
-                )
-                
-                # Single instance inference within batch loop
-                logits = self.model(list(inputs), training=False).numpy()[0]
-                arc, label = decode_arc_label_vector(logits, limit, len(self.tokenizer_label.word_index))
-                arcs.append(arc)
-                labels.append(label)
-                
-            labels_str = self.tokenizer_label.sequences_to_texts([[lbl] for lbl in labels])
-            result = [(idx + 1, token, arcs[idx], label or "UNK")
-                      for idx, (token, label) in enumerate(zip(safe_tokens, labels_str))]
-            final_results.append(result)
-            
+            if not tokens:
+                final_results.append([])
+                continue
+            tok_chunks = chunk_token_sequence(tokens, limit)
+            dep_chunks = []
+            for chunk_tokens in tok_chunks:
+                analyses = self.stemmer_analyzer.predict(chunk_tokens)
+                pos_res = self.pos_tagger.predict(chunk_tokens)
+                pos_tags = [tag for _, tag in pos_res]
+
+                arcs, labels = [], []
+                for _ in range(len(chunk_tokens)):
+                    inputs = process_treestack_dp_input(
+                        chunk_tokens, analyses, pos_tags, arcs, labels,
+                        self.tokenizer_word, self.tokenizer_morph_tag, self.tokenizer_pos, self.tokenizer_label,
+                        self.params['word_form'], self.params['sentence_max_len'], self.params['tag_max_len'],
+                        self.arc_label_vector_len
+                    )
+                    logits = self.model(list(inputs), training=False).numpy()[0]
+                    arc, label = decode_arc_label_vector(logits, limit, len(self.tokenizer_label.word_index))
+                    arcs.append(arc)
+                    labels.append(label)
+
+                labels_str = self.tokenizer_label.sequences_to_texts([[lbl] for lbl in labels])
+                dep_chunks.append([
+                    (idx + 1, token, arcs[idx], label or "UNK")
+                    for idx, (token, label) in enumerate(zip(chunk_tokens, labels_str))
+                ])
+            final_results.append(merge_dep_chunks(dep_chunks, tok_chunks))
+
         return final_results
 
 

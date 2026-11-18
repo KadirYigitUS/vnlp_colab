@@ -20,9 +20,10 @@ This module provides the modernized model creation function for the DP model,
 ensuring compatibility with the latest TensorFlow/Keras versions and Colab.
 """
 import logging
-from typing import List, Tuple, Dict
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import sentencepiece as spm
 import tensorflow as tf
 from tensorflow import keras
 
@@ -213,3 +214,32 @@ def dp_pos_to_displacy_format(
         arcs_data.append({'start': start, 'end': end, 'label': dep_label, 'dir': direction})
     
     return [{'words': words_data, 'arcs': arcs_data}]
+
+def chunk_token_sequence(tokens: Sequence[str], chunk_size: int = SENTENCE_MAX_LEN) -> List[List[str]]:
+    """Split tokens into contiguous chunks of at most chunk_size."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    return [list(tokens)[i:i + chunk_size] for i in range(0, len(tokens or ()), chunk_size)]
+
+def merge_dep_chunks(dep_chunks: Sequence[Optional[Sequence[Tuple[int, str, int, str]]]], token_chunks: Optional[Sequence[Optional[Sequence[str]]]] = None, oob_telemetry: Optional[Dict[str, int]] = None) -> List[Tuple[int, str, int, str]]:
+    """Merge chunked dependency 4-tuples by shifting token IDs and nonzero heads."""
+    chunks = list(dep_chunks or ())
+    while chunks and not chunks[-1]:
+        chunks.pop()
+    if token_chunks is not None and (len(token_chunks) < len(chunks) or any(token_chunks[len(chunks):])):
+        raise ValueError(f"Chunk count mismatch: {len(token_chunks)} != {len(chunks)}")
+    merged: List[Tuple[int, str, int, str]] = []
+    offset = 0
+    for idx, dep_chunk in enumerate(chunks):
+        chunk_len = len(dep_chunk or ())
+        if token_chunks is not None and len(token_chunks[idx] or ()) != chunk_len:
+            raise ValueError(f"Chunk length mismatch at {idx}")
+        for local_id, word, local_head, rel in (dep_chunk or ()):
+            if local_head > chunk_len:
+                logger.warning("dep_head_oob: head=%d > chunk_len=%d (chunk=%d)", local_head, chunk_len, idx)
+                if oob_telemetry is not None:
+                    oob_telemetry["dep_head_oob"] = oob_telemetry.get("dep_head_oob", 0) + 1
+                local_head = chunk_len
+            merged.append((local_id + offset, word, (local_head + offset) if local_head > 0 else 0, rel))
+        offset += chunk_len
+    return merged
