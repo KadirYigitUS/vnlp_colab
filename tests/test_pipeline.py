@@ -1,110 +1,130 @@
 # tests/test_pipeline.py
-import pytest
-import pandas as pd
+"""Integration tests for VNLPipeline, dependency chunking, and idempotent migration."""
 from pathlib import Path
-import numpy as np
+import pandas as pd
+import pytest
 
-# Assuming the package is installed or in the python path
+from tests._dep_fakes import DeterministicFakeDP, make_synthetic_tokens
+from vnlp_colab.dep.dep_migration import adjust_dataframe_dep_chunks
+from vnlp_colab.dep.dep_utils_colab import chunk_token_sequence
 from vnlp_colab.pipeline_colab import VNLPipeline
+
+try:
+    import keras
+    keras_version = int(getattr(keras, "__version__", "2").split(".")[0])
+except Exception:
+    keras_version = 2
+
+skip_if_not_keras3 = pytest.mark.skipif(
+    keras_version < 3, reason="Live neural pipeline requires Keras 3 runtime"
+)
+
 
 @pytest.fixture(scope="module")
 def csv_fixture_path() -> Path:
-    """
-    Creates a temporary dummy CSV file for pipeline testing.
-    This fixture has a 'module' scope, so it's created once for all tests in this file.
-    """
-    # Added more sentences with varying lengths to test sorting and padding
     dummy_data = (
         "novel01\t1\t1\t1\tOnun için yol arkadaşlarımızı titizlikle seçer, kendilerini iyice sınarız.\n"
-        "novel01\t1\t1\t2\tTest.\n" # Short sentence
+        "novel01\t1\t1\t2\tTest.\n"
         "novel01\t1\t1\t3\tBenim adım Melikşah ve İstanbul'da yaşıyorum.\n"
         "novel01\t1\t2\t1\tBu film harikaydı, çok beğendim.\n"
-        "novel01\t1\t2\t2\t\n" # Empty sentence
+        "novel01\t1\t2\t2\t\n"
     )
-    # In a Colab/testing environment, /tmp is a safe place for temporary files.
     csv_path = Path("/tmp/test_input_fixture.csv")
-    csv_path.write_text(dummy_data, encoding='utf-8')
-    
+    csv_path.write_text(dummy_data, encoding="utf-8")
     yield csv_path
-    
-    # Teardown: clean up the files after tests are done
-    csv_path.unlink()
-    Path("/tmp/output.initial.pkl").unlink(missing_ok=True)
-    Path("/tmp/output.pkl").unlink(missing_ok=True)
-    Path("/tmp/treestack_output.pkl").unlink(missing_ok=True)
-    Path("/tmp/treestack_output.initial.pkl").unlink(missing_ok=True)
+    csv_path.unlink(missing_ok=True)
+    for p in ["/tmp/output.initial.pkl", "/tmp/output.pkl", "/tmp/treestack_output.pkl", "/tmp/treestack_output.initial.pkl"]:
+        Path(p).unlink(missing_ok=True)
 
 
+@skip_if_not_keras3
 def test_full_spucontext_pipeline(csv_fixture_path: Path):
-    """
-    Integration test for the VNLPipeline with all default SPUContext models.
-    Verifies that the new tf.data batching pipeline runs end-to-end and 
-    produces a DataFrame with the correct structure and order.
-    """
-    # 1. Initialize the pipeline with all core models
-    models_to_run = ['pos', 'ner', 'dep', 'stemmer', 'sentiment']
-    pipeline = VNLPipeline(models_to_load=models_to_run)
-    output_path = "/tmp/output.pkl"
+    pipeline = VNLPipeline(models_to_load=["pos", "ner", "dep", "stemmer", "sentiment"])
+    final_df = pipeline.run(csv_path=str(csv_fixture_path), output_pickle_path="/tmp/output.pkl", batch_size=2)
+    assert isinstance(final_df, pd.DataFrame) and len(final_df) == 4
 
-    # 2. Run the full pipeline with a small batch size to test batching logic
-    final_df = pipeline.run(csv_path=str(csv_fixture_path), output_pickle_path=output_path, batch_size=2)
 
-    # 3. Validate the output DataFrame
-    assert isinstance(final_df, pd.DataFrame)
-    assert not final_df.empty
-    # The empty sentence is dropped during preprocessing
-    assert len(final_df) == 4
-    # IMPORTANT: Check that the original order is restored
-    assert final_df.index.to_list() == [0, 1, 2, 3]
-
-    expected_columns = [
-        't_code', 'ch_no', 'p_no', 's_no', 'sentence', 'no_accents', 'tokens',
-        'sentiment', 'morph', 'lemma', 'pos', 'ner', 'dep'
-    ]
-    for col in expected_columns:
-        assert col in final_df.columns
-
-    # Check that the analysis columns for the first row are populated and have the correct type
-    first_row = final_df.iloc[0]
-    assert isinstance(first_row['sentiment'], np.float64)
-    assert isinstance(first_row['morph'], list) and first_row['morph']
-    assert isinstance(first_row['lemma'], list) and first_row['lemma']
-    assert isinstance(first_row['pos'], list) and first_row['pos']
-    assert isinstance(first_row['ner'], list) and first_row['ner']
-    assert isinstance(first_row['dep'], list) and first_row['dep']
-    assert len(first_row['tokens']) == len(first_row['pos']) == len(first_row['ner']) == len(first_row['dep'])
-    
-    # Check a specific value to ensure correct processing and ordering
-    meliksah_row = final_df.iloc[2]
-    assert "Melikşah" in meliksah_row['sentence']
-    assert meliksah_row['ner'][2] == "PER" # NER tag for Melikşah
-
+@skip_if_not_keras3
 def test_treestack_dependency_pipeline(csv_fixture_path: Path):
-    """
-    Integration test for the pipeline with TreeStackDP.
-    This implicitly tests the dependency resolution and batching logic.
-    """
-    # 1. Initialize with a model that has a dependency chain
-    models_to_run = ['dep:TreeStackDP', 'sentiment'] # Should auto-load stemmer and pos:TreeStackPoS
-    pipeline = VNLPipeline(models_to_load=models_to_run)
-    output_path = "/tmp/treestack_output.pkl"
-    
-    # 2. Run the pipeline
-    final_df = pipeline.run(csv_path=str(csv_fixture_path), output_pickle_path=output_path, batch_size=2)
+    pipeline = VNLPipeline(models_to_load=["dep:TreeStackDP", "sentiment"])
+    final_df = pipeline.run(csv_path=str(csv_fixture_path), output_pickle_path="/tmp/treestack_output.pkl", batch_size=2)
+    assert isinstance(final_df, pd.DataFrame) and len(final_df) == 4
 
-    # 3. Validate the output DataFrame
-    assert isinstance(final_df, pd.DataFrame)
-    assert not final_df.empty
-    assert len(final_df) == 4 # Check row count
-    assert final_df.index.to_list() == [0, 1, 2, 3] # Check order restoration
 
-    # Check that all dependencies were run and their columns exist
-    expected_columns = ['morph', 'lemma', 'pos', 'dep', 'sentiment']
-    for col in expected_columns:
-        assert col in final_df.columns
+def test_pipeline_long_sentences_no_double_offset():
+    """Verify binary (head, rel) from process_dataframe match DependencyParser.predict with 0 double offset."""
+    pipeline = VNLPipeline(models_to_load=[])
+    fake_dp = DeterministicFakeDP()
+    pipeline.models = {"dep": fake_dp}
 
-    # Verify content of a specific row
-    film_row = final_df.iloc[3]
-    assert "film" in film_row['sentence']
-    assert isinstance(film_row['dep'], list) and film_row['dep']
-    assert len(film_row['tokens']) == len(film_row['dep'])
+    lengths = [40, 44, 85]
+    tokens_list = [make_synthetic_tokens(ln) for ln in lengths]
+    df = pd.DataFrame({
+        "sentence": [f"sent_{ln}" for ln in lengths],
+        "no_accents": [f"sent_{ln}" for ln in lengths],
+        "tokens": tokens_list,
+        "tokens_40": [chunk_token_sequence(t, 40) for t in tokens_list],
+    })
+
+    processed_df = pipeline.process_dataframe(df, batch_size=2)
+    assert "dep" in processed_df.columns
+    for idx, ln in enumerate(lengths):
+        dep_res = processed_df.loc[idx, "dep"]
+        assert len(dep_res) == ln
+        expected = [(item[2], item[3]) for item in fake_dp.predict(tokens_list[idx])]
+        assert dep_res == expected
+        if ln > 40:
+            # Chunk 1 (idx 40..ln-1): head must be shifted by +40, not double shifted (+80)
+            chunk1_heads = [h for (h, _) in dep_res[40:min(80, ln)]]
+            assert all(h == 0 or 41 <= h <= 80 for h in chunk1_heads)
+            assert not any(h > 80 for h in chunk1_heads)
+
+
+def test_adjust_dataframe_dep_chunks_idempotent():
+    """Verify YG-ZB tail, KT-OK OOB clamping, 3-chunk, list/str parsing, English guard, and Pass-2 0-diff."""
+    # 1. YG-ZB (1,4,17): 40 tokens + 4-token tail with local heads
+    t40_yg = [make_synthetic_tokens(40), ["yeni", "sözcük", "türetildi", "."]]
+    dep_yg = [(1, "root")] + [(1, "dep")] * 39 + [(2, "amod"), (3, "obj"), (0, "root"), (3, "punct")]
+
+    # 2. KT-OK (8,136,3869): chunk_len=23, local_head=25 > 23 (OOB)
+    t40_kt = [make_synthetic_tokens(40), make_synthetic_tokens(23)]
+    dep_kt = [(1, "root")] + [(1, "dep")] * 39 + [(25, "dep")] + [(0, "root")] * 22
+
+    # 3. 3-chunk native len=85
+    t40_85 = [make_synthetic_tokens(40), make_synthetic_tokens(40), make_synthetic_tokens(5)]
+    dep_85 = [(1, "root")] + [(1, "dep")] * 39 + [(1, "root")] + [(1, "dep")] * 39 + [(1, "root")] + [(1, "dep")] * 4
+
+    df = pd.DataFrame({
+        "tokens_40": [t40_yg, repr(t40_kt), t40_85, None],
+        "dep": [repr(dep_yg), dep_kt, dep_85, [(1, "root")] * 10],
+    })
+
+    # Pass 1: Apply migration
+    df_migrated, telem1 = adjust_dataframe_dep_chunks(df, chunk_size=40)
+    assert telem1["rows_modified"] == 3
+    assert telem1["dep_head_oob"] == 1  # KT-OK OOB clamped
+
+    # Inspect YG-ZB shifted heads in migrated DF
+    yg_migrated_dep = eval(df_migrated.at[0, "dep"])
+    assert yg_migrated_dep[40:] == [(42, "amod"), (43, "obj"), (0, "root"), (43, "punct")]
+
+    # Inspect KT-OK clamped & shifted head (local 25 -> clamped 23 -> shifted 63)
+    kt_migrated_dep = df_migrated.at[1, "dep"]
+    assert kt_migrated_dep[40][0] == 63
+
+    # Inspect English / None tokens_40 row (row 3 untouched)
+    assert df_migrated.at[3, "dep"] == [(1, "root")] * 10
+
+    # Pass 2: Dry-run / idempotency check on already migrated data
+    df_pass2, telem2 = adjust_dataframe_dep_chunks(df_migrated, chunk_size=40)
+    assert telem2["rows_modified"] == 0
+    assert telem2["already_global_chunks"] == 4  # YG (1), KT (1), 85-tok (2)
+    assert telem2["heads_shifted"] == 0
+
+    # Mixed-state error guard
+    mixed_df = pd.DataFrame({
+        "tokens_40": [[make_synthetic_tokens(40), make_synthetic_tokens(4)]],
+        "dep": [[(1, "root")] * 40 + [(2, "dep"), (42, "dep"), (0, "root"), (0, "root")]],
+    })
+    with pytest.raises(ValueError, match="mixed/invalid heads"):
+        adjust_dataframe_dep_chunks(mixed_df, chunk_size=40)

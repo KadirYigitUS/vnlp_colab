@@ -51,7 +51,7 @@ def adjust_dataframe_dep_chunks(
 
     for idx in df_out.index:
         t40_raw = df_out.at[idx, "tokens_40"]
-        if pd.isna(t40_raw):
+        if t40_raw is None or (not isinstance(t40_raw, (list, tuple, dict, str)) and pd.isna(t40_raw)):
             continue
 
         t40 = _parse_list_field(t40_raw)

@@ -53,7 +53,14 @@ def setup_logging(level: int = logging.INFO) -> None:
     os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
     tf.get_logger().setLevel('ERROR')
     logger.info("VNLP logging configured.")
-    logger.info(f"Running on TensorFlow v{tf.__version__} and Keras v{tf.keras.__version__}")
+    keras_ver = getattr(tf.keras, "__version__", None)
+    if keras_ver is None:
+        try:
+            import keras
+            keras_ver = getattr(keras, "__version__", "unknown")
+        except ImportError:
+            keras_ver = "unknown"
+    logger.info(f"Running on TensorFlow v{tf.__version__} and Keras v{keras_ver}")
 
 def get_vnlp_cache_dir() -> Path:
     """
